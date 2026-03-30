@@ -3,5 +3,6 @@ node_modules/
 .env
 .chat-history.json
 .panels.json
-.claude/
+.claude/*
+!.claude/skills/
 .mcp.json

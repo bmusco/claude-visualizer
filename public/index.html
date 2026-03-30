@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claud-io</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="header-left">
+      <button id="btn-history" class="btn btn-icon" title="Chat History">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+      </button>
+      <h1>Claud-io</h1>
+      <span class="connection-status" id="status">Connecting...</span>
+    </div>
+    <div class="header-right">
+      <!-- Consolidated "+" add menu -->
+      <div class="add-menu-wrapper">
+        <button id="btn-add" class="btn" title="Add content">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2"><line x1="7" y1="1" x2="7" y2="13"/><line x1="1" y1="7" x2="13" y2="7"/></svg>
+          <span>Add</span>
+        </button>
+        <div class="add-menu-dropdown" id="add-menu-dropdown">
+          <button onclick="document.getElementById('paste-modal').classList.add('active'); closeAddMenu()">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 1H4a1 1 0 00-1 1v12a1 1 0 001 1h8a1 1 0 001-1V4z"/><path d="M10 1v3h3"/></svg>
+            Paste Content
+          </button>
+          <button onclick="document.getElementById('embed-modal').classList.add('active'); closeAddMenu()">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="3" width="14" height="10" rx="1.5"/><path d="M5 7l-2 2 2 2M11 7l2 2-2 2"/></svg>
+            Embed URL
+          </button>
+          <button onclick="openDriveSearch(); closeAddMenu()">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M5.5 1.5L1 9h5l4.5-7.5H5.5z"/><path d="M10.5 1.5L15 9h-5L5.5 1.5"/><path d="M1 9l2.5 5.5h9L15 9H1z"/></svg>
+            Google Drive
+          </button>
+        </div>
+      </div>
+      <button id="btn-present" class="btn btn-accent" title="Present panels as slides">Present</button>
+      <button id="btn-chat" class="btn btn-chat">Hide Chat</button>
+      <div class="settings-wrapper">
+        <button id="btn-settings" class="btn" title="Settings">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+        <div class="settings-dropdown" id="settings-dropdown"></div>
+      </div>
+    </div>
+  </header>
+
+  <!-- History Sidebar -->
+  <div class="history-sidebar" id="history-sidebar">
+    <div class="history-header">
+      <span class="history-title">Chat History</span>
+      <button class="btn btn-sm btn-accent" id="btn-new-chat" onclick="newConversation()">+ New Chat</button>
+    </div>
+    <div class="history-search">
+      <input type="text" id="history-search-input" class="input" placeholder="Search conversations..." style="margin-bottom:0">
+    </div>
+    <div class="history-list" id="history-list"></div>
+  </div>
+
+  <div class="app-layout" id="app-layout">
+    <main id="panels">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-hero">
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none" stroke="var(--accent-light)" stroke-width="1.5"><rect x="4" y="8" width="40" height="32" rx="4"/><path d="M4 16h40"/><circle cx="10" cy="12" r="1.5"/><circle cx="16" cy="12" r="1.5"/><circle cx="22" cy="12" r="1.5"/><path d="M16 28l4-4 4 4M28 26l3-3 3 3" stroke-width="1.8"/></svg>
+          <h2>Good afternoon</h2>
+          <p>I can create presentations, documents, charts, and more</p>
+        </div>
+        <div class="empty-prompts">
+          <button class="empty-prompt-btn" onclick="quickPrompt('presentation')">
+            <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="2" y="3" width="12" height="10" rx="1.5"/><rect x="5" y="5.5" width="6" height="5" rx="0.5"/></svg>
+            Create a presentation
+          </button>
+          <button class="empty-prompt-btn" onclick="quickPrompt('document')">
+            <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="3" y="1" width="10" height="14" rx="1.5"/><line x1="5.5" y1="5" x2="10.5" y2="5"/><line x1="5.5" y1="7.5" x2="10.5" y2="7.5"/><line x1="5.5" y1="10" x2="8.5" y2="10"/></svg>
+            Write a document
+          </button>
+          <button class="empty-prompt-btn" onclick="quickPrompt('chart')">
+            <svg width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="2" y="8" width="3" height="6"/><rect x="6.5" y="4" width="3" height="10"/><rect x="11" y="6" width="3" height="8"/></svg>
+            Build a chart
+          </button>
+        </div>
+        <div class="empty-hint">
+          <span class="kbd">&#8984;K</span> to toggle chat &middot; <span class="kbd">&#8984;/</span> for shortcuts
+        </div>
+      </div>
+    </main>
+
+    <!-- Chat Drawer (inside app-layout for side-by-side) -->
+    <div class="chat-drawer open" id="chat-drawer">
+      <div class="chat-header">
+        <span>Claude Chat</span>
+        <div class="chat-header-actions">
+          <button class="panel-btn" onclick="clearChatHistory()" title="New chat">New</button>
+          <button class="panel-btn" onclick="toggleChat()" title="Close">&times;</button>
+        </div>
+      </div>
+      <div class="chat-messages" id="chat-messages"></div>
+      <div id="chat-file-preview" class="chat-file-preview"></div>
+      <div class="chat-input-area">
+        <input type="file" id="chat-file-input" multiple hidden>
+        <div class="input-model-selector">
+          <button class="model-pill" id="model-pill" onclick="toggleModelPillMenu()">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+            <span id="model-pill-label">Sonnet 4.6</span>
+          </button>
+          <div class="model-pill-menu" id="model-pill-menu"></div>
+        </div>
+        <div class="chat-input-bar">
+          <button class="btn chat-attach-btn" onclick="document.getElementById('chat-file-input').click()" title="Attach file">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 8.5l-5.5 5.5a3.5 3.5 0 01-5-5L9 3.5a2.5 2.5 0 013.5 3.5L7 12.5a1.5 1.5 0 01-2-2L10.5 5"/></svg>
+          </button>
+          <button class="btn chat-attach-btn gdrive-btn" onclick="openDriveSearch()" title="Google Drive">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M5.5 1.5L1 9h5l4.5-7.5H5.5z" stroke="currentColor" stroke-width="1.3"/><path d="M10.5 1.5L15 9h-5L5.5 1.5" stroke="currentColor" stroke-width="1.3"/><path d="M1 9l2.5 5.5h9L15 9H1z" stroke="currentColor" stroke-width="1.3"/></svg>
+          </button>
+          <textarea id="chat-input" placeholder="Ask Claude anything..." rows="1"></textarea>
+          <div class="chat-input-actions">
+            <button id="chat-send" class="chat-send-btn" title="Send (Enter)">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="chat-input-disclaimer">
+          Claude can make mistakes. Check important info.
+        </div>
+      </div>
+    </div>
+  </div> <!-- close app-layout -->
+
+  <!-- Keyboard shortcuts modal -->
+  <div class="modal" id="shortcuts-modal">
+    <div class="modal-content" style="max-width:400px">
+      <h2>Keyboard Shortcuts</h2>
+      <div class="shortcuts-list">
+        <div><span class="kbd">&#8984;K</span> Toggle chat</div>
+        <div><span class="kbd">&#8984;/</span> Show shortcuts</div>
+        <div><span class="kbd">&#8984;N</span> New chat</div>
+        <div><span class="kbd">&#8984;P</span> Present</div>
+        <div><span class="kbd">Esc</span> Close panel / modal</div>
+        <div><span class="kbd">Dbl-click</span> Expand panel</div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="document.getElementById('shortcuts-modal').classList.remove('active')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modals -->
+  <div class="modal" id="paste-modal">
+    <div class="modal-content">
+      <h2>Paste Content</h2>
+      <input type="text" id="paste-title" placeholder="Panel title" class="input">
+      <select id="paste-type" class="input">
+        <option value="markdown">Markdown / Table</option>
+        <option value="chart-bar">Bar Chart (JSON)</option>
+        <option value="chart-line">Line Chart (JSON)</option>
+        <option value="chart-pie">Pie Chart (JSON)</option>
+      </select>
+      <textarea id="paste-content" placeholder="Paste markdown, table, or chart JSON..." class="textarea"></textarea>
+      <div class="modal-actions">
+        <button class="btn" onclick="closePasteModal()">Cancel</button>
+        <button class="btn btn-accent" onclick="submitPaste()">Add Panel</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal" id="embed-modal">
+    <div class="modal-content">
+      <h2>Embed URL</h2>
+      <input type="text" id="embed-title" placeholder="Panel title" class="input">
+      <input type="text" id="embed-url" placeholder="Google Docs/Slides/Sheets URL..." class="input">
+      <div class="modal-actions">
+        <button class="btn" onclick="closeEmbedModal()">Cancel</button>
+        <button class="btn btn-accent" onclick="submitEmbed()">Embed</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal" id="gdrive-modal">
+    <div class="modal-content">
+      <h2>Link from Google Drive</h2>
+      <div class="gdrive-search-row">
+        <input type="text" id="gdrive-query" placeholder="Search your Google Drive..." class="input" style="margin-bottom:0">
+        <button class="btn btn-accent" onclick="searchDrive()">Search</button>
+      </div>
+      <div id="gdrive-results" class="gdrive-results"></div>
+      <div class="modal-actions">
+        <button class="btn" onclick="closeDriveSearch()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div class="modal" id="settings-modal">
+    <div class="modal-content settings-modal-content">
+      <div class="modal-header-row">
+        <h2>Settings</h2>
+        <button class="btn" onclick="closeSettingsModal()">&times;</button>
+      </div>
+      <div id="settings-modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Memories Overlay -->
+  <div class="memories-overlay" id="memories-overlay">
+    <div class="memories-container">
+      <div class="memories-header">
+        <h2>Memories</h2>
+        <button class="btn" onclick="closeMemories()">&times;</button>
+      </div>
+      <div class="memories-toolbar">
+        <input type="text" id="memory-search" class="input" placeholder="Search memories..." style="margin-bottom:0;flex:1">
+        <div class="memory-filters" id="memory-filters">
+          <button class="filter-pill active" data-filter="all" onclick="filterMemories('all', this)">All</button>
+          <button class="filter-pill" data-filter="user" onclick="filterMemories('user', this)">User</button>
+          <button class="filter-pill" data-filter="feedback" onclick="filterMemories('feedback', this)">Feedback</button>
+          <button class="filter-pill" data-filter="project" onclick="filterMemories('project', this)">Project</button>
+          <button class="filter-pill" data-filter="reference" onclick="filterMemories('reference', this)">Reference</button>
+        </div>
+      </div>
+      <div class="memories-grid" id="memories-grid"></div>
+      <div class="memories-add-section" id="memories-add-section" style="display:none">
+        <h3>Add New Memory</h3>
+        <input type="text" id="new-memory-name" class="input" placeholder="Memory name">
+        <select id="new-memory-type" class="input">
+          <option value="project">Project</option>
+          <option value="user">User Preference</option>
+          <option value="feedback">Feedback</option>
+          <option value="reference">Reference</option>
+        </select>
+        <textarea id="new-memory-content" class="textarea" placeholder="Memory content (markdown supported)..." style="height:120px"></textarea>
+        <div class="modal-actions">
+          <button class="btn" onclick="toggleAddMemory()">Cancel</button>
+          <button class="btn btn-accent" onclick="saveNewMemory()">Save Memory</button>
+        </div>
+      </div>
+      <div class="memories-footer">
+        <button class="btn btn-accent" onclick="toggleAddMemory()">+ Add Memory</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="presentation-overlay" id="presentation">
+    <div class="presentation-header">
+      <span id="slide-counter">1 / 1</span>
+      <button class="btn btn-danger" onclick="exitPresentation()">Exit</button>
+    </div>
+    <div class="presentation-content" id="presentation-content"></div>
+    <button class="pres-nav pres-prev" onclick="prevSlide()">&larr;</button>
+    <button class="pres-nav pres-next" onclick="nextSlide()">&rarr;</button>
+  </div>
+
+  <!-- Drop overlay for drag-and-drop files -->
+  <div class="drop-overlay" id="drop-overlay">
+    <div class="drop-overlay-content">
+      <svg width="48" height="48" viewBox="0 0 16 16" fill="none" stroke="var(--accent)" stroke-width="1.5"><path d="M14 8.5l-5.5 5.5a3.5 3.5 0 01-5-5L9 3.5a2.5 2.5 0 013.5 3.5L7 12.5a1.5 1.5 0 01-2-2L10.5 5"/></svg>
+      <span>Drop files to attach</span>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

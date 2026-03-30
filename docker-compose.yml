@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  claudio:
+    build: .
+    ports:
+      - "3333:3333"
+    volumes:
+      - ~/.claude:/home/appuser/.claude:ro
+    environment:
+      - NODE_ENV=development
+      - CLAUDE_CLI_PATH=/usr/local/bin/claude
+      - CLAUDIO_HOME=/home/appuser
+    restart: unless-stopped

@@ -1,0 +1,9 @@
+node_modules
+.git
+.gitignore
+.claude
+.mcp.json
+*.log
+tmp
+.DS_Store
+INTERNAL-TOOL-LAUNCH-CURSOR-HANDOFF.md

@@ -1,0 +1,80 @@
+#!/bin/bash
+# cv - Claude Visualizer CLI helper
+BASE="http://localhost:3333"
+DIR="$HOME/claude-visualizer"
+
+case "$1" in
+  start)
+    # Check if already running
+    if curl -s "$BASE/api/panels" > /dev/null 2>&1; then
+      echo "Visualizer already running at $BASE"
+    else
+      cd "$DIR" && nohup node server.js > /tmp/claude-visualizer.log 2>&1 &
+      sleep 1
+      if curl -s "$BASE/api/panels" > /dev/null 2>&1; then
+        echo "Visualizer started at $BASE"
+      else
+        echo "Failed to start. Check /tmp/claude-visualizer.log"
+        exit 1
+      fi
+    fi
+    open "$BASE"
+    ;;
+  stop)
+    pkill -f "node $DIR/server.js" 2>/dev/null && echo "Visualizer stopped" || echo "Not running"
+    ;;
+  restart)
+    pkill -f "node $DIR/server.js" 2>/dev/null
+    sleep 1
+    cd "$DIR" && nohup node server.js > /tmp/claude-visualizer.log 2>&1 &
+    sleep 1
+    echo "Visualizer restarted at $BASE"
+    open "$BASE"
+    ;;
+  push)
+    TITLE="${2:-Output}"
+    curl -s -X POST "$BASE/api/pipe" -H "X-Title: $TITLE" --data-binary @- | jq .
+    ;;
+  embed)
+    TITLE="${2:-Embed}"
+    URL="$3"
+    curl -s -X POST "$BASE/api/panel" -H 'Content-Type: application/json' \
+      -d "{\"type\":\"embed\",\"title\":\"$TITLE\",\"url\":\"$URL\"}" | jq .
+    ;;
+  chart)
+    TITLE="${2:-Chart}"
+    TYPE="${3:-bar}"
+    CONTENT=$(cat)
+    curl -s -X POST "$BASE/api/panel" -H 'Content-Type: application/json' \
+      -d "{\"type\":\"chart-$TYPE\",\"title\":\"$TITLE\",\"content\":$CONTENT}" | jq .
+    ;;
+  clear)
+    curl -s -X POST "$BASE/api/clear" | jq .
+    ;;
+  open)
+    open "$BASE"
+    ;;
+  status)
+    if curl -s "$BASE/api/panels" > /dev/null 2>&1; then
+      COUNT=$(curl -s "$BASE/api/panels" | jq length)
+      echo "Running at $BASE ($COUNT panels)"
+    else
+      echo "Not running"
+    fi
+    ;;
+  *)
+    echo "Claude Visualizer"
+    echo ""
+    echo "Usage: cv <command> [args]"
+    echo ""
+    echo "  cv start                  Start server and open browser"
+    echo "  cv stop                   Stop server"
+    echo "  cv restart                Restart server"
+    echo "  cv status                 Check if running"
+    echo "  cv open                   Open in browser"
+    echo "  cv push \"Title\"           Pipe markdown/text to a panel"
+    echo "  cv embed \"Title\" \"URL\"    Embed Google Doc/Slides/Sheet"
+    echo "  cv chart \"Title\" [type]   Pipe Chart.js JSON (bar/line/pie)"
+    echo "  cv clear                  Clear all panels"
+    ;;
+esac

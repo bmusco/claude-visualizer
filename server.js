@@ -352,6 +352,20 @@ app.get('/api/auth/:provider/status', (req, res) => {
   res.json({ ok: true, connected: !expired, hasRefreshToken: !!tokenData.refreshToken });
 });
 
+// Return decrypted access token for browser-side MCP calls
+app.get('/api/auth/:provider/token', (req, res) => {
+  const provider = req.params.provider;
+  let session = req.userSession;
+  if (!session?.tokens?.[provider]) {
+    for (const [, sess] of userTokenStore) {
+      if (sess.tokens?.[provider]) { session = sess; break; }
+    }
+  }
+  const tokenData = session?.tokens?.[provider];
+  if (!tokenData?.accessToken) return res.json({ ok: false });
+  res.json({ ok: true, accessToken: decryptToken(tokenData.accessToken) });
+});
+
 app.post('/api/auth/:provider/disconnect', (req, res) => {
   const provider = req.params.provider;
   if (req.userSession?.tokens?.[provider]) {
@@ -1677,9 +1691,10 @@ wss.on('connection', (ws, req) => {
       fullPrompt = fullPrompt.replace(/\x00/g, '');
 
       // ── Quick mode vs Normal mode ──
-      // Force quick mode when MCP data was pre-fetched (no need for CLI to connect to MCP)
+      // Force quick mode when MCP data was pre-fetched (browser-side or server-side)
       const isEditing = !!msg.editingPanel;
-      const skipMcp = mcpPreFetched || canSkipMcp(userMessage, isEditing);
+      const browserPreFetched = !!msg.browserPreFetched;
+      const skipMcp = mcpPreFetched || browserPreFetched || canSkipMcp(userMessage, isEditing);
 
       const cliArgs = ['-p', '--verbose', '--output-format', 'stream-json', '--include-partial-messages'];
       if (selectedModel) cliArgs.push('--model', selectedModel);

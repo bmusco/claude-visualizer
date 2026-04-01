@@ -2049,10 +2049,132 @@ CMT style: white bg, blue (#1a80d7) accents, black body. Allowed backgrounds: #F
   renderHistoryList();
 
   showStatus();
-  ws.send(JSON.stringify({ action: 'chat', text: fullText, files: attachedFiles, conversationId: activeConversationId, editingPanel: !!editingPanel }));
+
+  // Browser-side MCP pre-fetch (server can't reach portal, but browser can via Jamf)
+  browserPreFetchAndSend(fullText, attachedFiles, activeConversationId, !!editingPanel);
 
   attachedFiles = [];
   renderFilePreview();
+}
+
+async function browserPreFetchAndSend(fullText, files, conversationId, editingPanel) {
+  const lower = fullText.toLowerCase();
+  const preFetchData = [];
+
+  // Detect intents and fetch from browser
+  const googleConnected = appConfig?.oauthStatus?.['google-workspace'];
+  const slackConnected = appConfig?.oauthStatus?.['slack'];
+
+  if (googleConnected) {
+    try {
+      if (/\b(email|gmail|inbox|unread|mail)\b/.test(lower)) {
+        showStatus('Searching Gmail...');
+        let query = 'is:unread';
+        const fromMatch = lower.match(/(?:from|email from)\s+(\S+)/);
+        if (fromMatch) query = 'from:' + fromMatch[1];
+        const aboutMatch = lower.match(/(?:about|subject|regarding)\s+"?([^"]+)"?/);
+        if (aboutMatch) query = 'subject:' + aboutMatch[1].trim();
+        const data = await browserMcpCall('google-workspace', 'gmail_search', { query, max_results: 10 });
+        if (data) preFetchData.push({ tool: 'gmail_search', data });
+      }
+      if (/\b(calendar|schedule|meeting|event|agenda|today)/i.test(lower)) {
+        showStatus('Checking calendar...');
+        const now = new Date();
+        const eod = new Date(now); eod.setHours(23, 59, 59);
+        const data = await browserMcpCall('google-workspace', 'gcal_list_events', { time_min: now.toISOString(), time_max: eod.toISOString(), max_results: 20 });
+        if (data) preFetchData.push({ tool: 'gcal_list_events', data });
+      }
+      if (/\b(task|todo|to-do|tasks)\b/.test(lower) && !/redshift|sql|query/.test(lower)) {
+        showStatus('Loading tasks...');
+        const data = await browserMcpCall('google-workspace', 'gtasks_list', { max_results: 50 });
+        if (data) preFetchData.push({ tool: 'gtasks_list', data });
+      }
+      if (/\b(search\s+drive|find\s+(?:in\s+)?drive|drive\s+for)\b/.test(lower)) {
+        const m = lower.match(/(?:search\s+drive\s+for|find\s+in\s+drive|drive\s+for)\s+"?([^"]+)"?/);
+        if (m) {
+          showStatus('Searching Drive...');
+          const data = await browserMcpCall('google-workspace', 'gdrive_search', { query: m[1].trim() });
+          if (data) preFetchData.push({ tool: 'gdrive_search', data });
+        }
+      }
+    } catch (e) { console.error('Google pre-fetch error:', e); }
+  }
+
+  if (slackConnected) {
+    try {
+      if (/\b(slack|channel|#\w+|dm\b|direct\s+message|message\s+(?:from|with|to))\b/.test(lower)) {
+        showStatus('Searching Slack...');
+        let query = lower.replace(/\b(search|slack|for|find|in|my|last|check|what|read)\b/g, '').trim();
+        if (/\b(dm|direct\s+message|message)\b/.test(lower)) {
+          const personMatch = lower.match(/(?:dm|message)\s+(?:from|with|to)\s+(\w+)/);
+          if (personMatch) query = 'from:' + personMatch[1];
+        }
+        const channelMatch = lower.match(/#(\w[\w-]*)/);
+        if (channelMatch) {
+          const data = await browserSlackMcpCall('slack_read_channel', { channel: channelMatch[1], max_results: 20 });
+          if (data) preFetchData.push({ tool: 'slack_read_channel', data });
+        } else if (query.length > 2) {
+          const data = await browserSlackMcpCall('slack_search', { query, max_results: 10 });
+          if (data) preFetchData.push({ tool: 'slack_search', data });
+        }
+      }
+    } catch (e) { console.error('Slack pre-fetch error:', e); }
+  }
+
+  // Append pre-fetched data to the prompt
+  let enrichedText = fullText;
+  if (preFetchData.length > 0) {
+    enrichedText += preFetchData.map(r =>
+      '\n[PRE-FETCHED ' + r.tool.toUpperCase() + ' DATA — use this data to answer the user\'s question]\n' + r.data
+    ).join('\n');
+  }
+
+  showStatus();
+  ws.send(JSON.stringify({ action: 'chat', text: enrichedText, files, conversationId, editingPanel, browserPreFetched: preFetchData.length > 0 }));
+}
+
+// Browser-side MCP call to Google Workspace (stateless)
+async function browserMcpCall(provider, toolName, args) {
+  const tokenResp = await fetch(API_BASE + '/api/auth/' + provider + '/token');
+  const tokenData = await tokenResp.json();
+  if (!tokenData.ok || !tokenData.accessToken) return null;
+
+  const mcpUrl = 'https://portal.int-tools.cmtelematics.com/google-workspace-mcp/mcp';
+  const resp = await fetch(mcpUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', 'Authorization': 'Bearer ' + tokenData.accessToken },
+    body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/call', id: Date.now(), params: { name: toolName, arguments: args } }),
+  });
+  const text = await resp.text();
+  const dataMatch = text.match(/^data:\s*(.+)$/m);
+  const parsed = dataMatch ? JSON.parse(dataMatch[1]) : JSON.parse(text);
+  if (!parsed?.result?.content) return null;
+  return parsed.result.content.filter(c => c.type === 'text').map(c => c.text).join('');
+}
+
+// Browser-side MCP call to Slack (stateful — needs session)
+let slackSessionId = null;
+async function browserSlackMcpCall(toolName, args) {
+  const tokenResp = await fetch(API_BASE + '/api/auth/slack/token');
+  const tokenData = await tokenResp.json();
+  if (!tokenData.ok || !tokenData.accessToken) return null;
+
+  const mcpUrl = 'https://portal.int-tools.cmtelematics.com/slack-mcp/mcp';
+  const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', 'Authorization': 'Bearer ' + tokenData.accessToken };
+
+  // Initialize session if needed
+  if (!slackSessionId) {
+    const initResp = await fetch(mcpUrl, { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', method: 'initialize', id: 1, params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'claudio-browser', version: '1.0' } } }) });
+    slackSessionId = initResp.headers.get('mcp-session-id');
+  }
+
+  headers['mcp-session-id'] = slackSessionId;
+  const resp = await fetch(mcpUrl, { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/call', id: Date.now(), params: { name: toolName, arguments: args } }) });
+  const text = await resp.text();
+  const dataMatch = text.match(/^data:\s*(.+)$/m);
+  const parsed = dataMatch ? JSON.parse(dataMatch[1]) : JSON.parse(text);
+  if (!parsed?.result?.content) return null;
+  return parsed.result.content.filter(c => c.type === 'text').map(c => c.text).join('');
 }
 
 function getCurrentContent(panel) {

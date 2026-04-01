@@ -1423,7 +1423,7 @@ function detectMcpIntent(prompt) {
     }
   }
 
-  if (/\b(slack|channel|#\w+)\b/.test(lower)) {
+  if (/\b(slack|channel|#\w+|dm\b|direct\s+message|message\s+(?:from|with|to))\b/.test(lower)) {
     if (/\b(search\s+slack|slack\s+for|find\s+(?:in\s+)?slack)\b/.test(lower)) {
       const queryMatch = lower.match(/(?:search\s+slack\s+for|slack\s+for|find\s+in\s+slack)\s+"?([^"]+)"?/);
       const query = queryMatch ? queryMatch[1].trim() : lower.replace(/\b(search|slack|for|find|in)\b/g, '').trim();
@@ -1435,6 +1435,10 @@ function detectMcpIntent(prompt) {
       } else {
         intents.push({ provider: 'slack', tool: 'slack_list_channels', args: { max_results: 20 }, label: 'Listing Slack channels...' });
       }
+    } else if (/\b(dm|direct\s+message|message\s+(?:from|with|to))\b/.test(lower)) {
+      const personMatch = lower.match(/(?:dm|direct\s+message|message)\s+(?:from|with|to)\s+(\w+)/);
+      const query = personMatch ? personMatch[1] : lower.replace(/\b(my|last|dm|direct|message|with|from|to|recent)\b/g, '').trim();
+      intents.push({ provider: 'slack', tool: 'slack_search', args: { query: `from:${query}`, max_results: 10 }, label: `Searching Slack DMs with ${query}...` });
     } else {
       const query = lower.replace(/\b(slack|about|what|tell|me)\b/g, '').trim();
       if (query.length > 2) {

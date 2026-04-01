@@ -249,7 +249,7 @@ function connectIntegration(serverId, shortName, btn) {
   if (badge) { badge.textContent = 'Connecting...'; badge.className = 'integration-badge checking'; }
   if (statusMsg) { statusMsg.textContent = 'Opening sign-in...'; statusMsg.className = 'settings-status-msg'; }
 
-  fetch(`${API_BASE}/api/auth/${serverId}/start`, { credentials: 'include' })
+  fetch(`${API_BASE}/api/auth/${serverId}/start`)
     .then(r => r.json())
     .then(data => {
       if (!data.ok || !data.authUrl) {
@@ -293,18 +293,23 @@ function connectIntegration(serverId, shortName, btn) {
 function checkUserAuthStatus(serverId) {
   const badge = document.getElementById('badge-' + serverId);
   const statusMsg = document.getElementById('status-' + serverId);
-  fetch(`${API_BASE}/api/auth/${serverId}/status`, { credentials: 'include' })
+  const connectBtn = document.getElementById('connect-btn-' + serverId);
+  fetch(`${API_BASE}/api/auth/${serverId}/status`)
     .then(r => r.json())
     .then(data => {
       if (badge) {
         badge.textContent = data.connected ? 'Connected' : 'Not Connected';
         badge.className = 'integration-badge ' + (data.connected ? 'connected' : 'disconnected');
       }
-      if (statusMsg && data.connected) {
-        statusMsg.textContent = '';
+      if (data.connected) {
+        if (statusMsg) statusMsg.textContent = '';
+        if (connectBtn) connectBtn.textContent = 'Reconnect';
       }
     })
-    .catch(() => {});
+    .catch(err => {
+      console.error('Auth status check failed for', serverId, err);
+      if (badge) { badge.textContent = 'Not Connected'; badge.className = 'integration-badge disconnected'; }
+    });
 }
 
 function saveAtlassianCredentials(btn) {

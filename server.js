@@ -144,14 +144,19 @@ const MCP_OAUTH_SERVERS = {
 };
 
 const oauthClients = new Map();
-const OAUTH_CLIENTS_FILE = path.join(__dirname, '.oauth-clients.json');
-try {
-  const saved = JSON.parse(fs.readFileSync(OAUTH_CLIENTS_FILE, 'utf-8'));
-  for (const [k, v] of Object.entries(saved)) oauthClients.set(k, v);
-  console.log(`[OAUTH] Loaded ${oauthClients.size} OAuth clients from ${OAUTH_CLIENTS_FILE}`);
-} catch (e) {
-  console.log(`[OAUTH] No pre-registered clients at ${OAUTH_CLIENTS_FILE}: ${e.message}`);
+const OAUTH_CLIENTS_PATHS = [
+  path.join(__dirname, '.oauth-clients.json'),
+  path.join(os.homedir(), '.oauth-clients.json'),
+];
+for (const p of OAUTH_CLIENTS_PATHS) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(p, 'utf-8'));
+    for (const [k, v] of Object.entries(saved)) oauthClients.set(k, v);
+    console.log(`[OAUTH] Loaded ${oauthClients.size} OAuth clients from ${p}`);
+    break;
+  } catch {}
 }
+if (oauthClients.size === 0) console.log('[OAUTH] No pre-registered OAuth clients found');
 
 function saveOauthClients() {
   const obj = {};

@@ -53,7 +53,12 @@ variable "container-port" {
 
 variable "alb-listener-priority" {
   type    = number
-  default = 240
+  default = 270
+}
+
+variable "api-hostname" {
+  type    = string
+  default = "claudio-api.int-tools.cmtelematics.com"
 }
 
 variable "alb-deregistration-delay" {

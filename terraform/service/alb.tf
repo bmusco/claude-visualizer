@@ -34,7 +34,7 @@ resource "aws_lb_listener_rule" "service-rule" {
 
   condition {
     host_header {
-      values = ["claudio-api.${var.domain-suffix}"]
+      values = [var.api-hostname]
     }
   }
 

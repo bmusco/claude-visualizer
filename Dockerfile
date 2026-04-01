@@ -1,17 +1,13 @@
 FROM node:20-slim
 
-RUN apt-get update && apt-get install -y curl ca-certificates && rm -rf /var/lib/apt/lists/*
-
-# Install Claude CLI (Linux x86_64)
-# Update this URL when the official download path is confirmed
-RUN curl -fsSL https://storage.googleapis.com/anthropic-sdk/claude-code/claude-code-latest-linux-x64.tar.gz \
-    -o /tmp/claude.tar.gz \
-    && tar -xzf /tmp/claude.tar.gz -C /usr/local/bin \
-    && rm /tmp/claude.tar.gz \
-    && chmod +x /usr/local/bin/claude \
-    || echo "WARN: Claude CLI install failed — update URL in Dockerfile"
+RUN apt-get update && apt-get install -y curl ca-certificates git && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m appuser || true
+
+# Install Claude CLI via official installer (as appuser so it lands in ~/.local/bin)
+USER appuser
+RUN curl -fsSL https://claude.ai/install.sh | bash
+USER root
 
 WORKDIR /app
 
@@ -26,5 +22,8 @@ EXPOSE 3333
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
   CMD curl -f http://localhost:3333/api/panels || exit 1
+
+ENV PATH="/home/appuser/.local/bin:${PATH}"
+ENV CLAUDE_CLI_PATH="/home/appuser/.local/bin/claude"
 
 CMD ["node", "server.js"]

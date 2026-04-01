@@ -53,7 +53,7 @@ variable "container-port" {
 
 variable "alb-listener-priority" {
   type    = number
-  default = 230
+  default = 240
 }
 
 variable "alb-deregistration-delay" {

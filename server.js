@@ -241,6 +241,8 @@ app.get('/api/auth/:provider/start', async (req, res) => {
   }
 });
 
+// OAuth callback — sends code to browser which does token exchange
+// (ECS container can't reach portal.int-tools, but user's browser can via Jamf)
 app.get('/api/auth/callback', async (req, res) => {
   const { code, state, error } = req.query;
 
@@ -252,53 +254,74 @@ app.get('/api/auth/callback', async (req, res) => {
   if (!flow) {
     return res.send('<html><body><h2>Invalid or expired state</h2><script>window.close()</script></body></html>');
   }
-  pendingOauthFlows.delete(state);
 
   const provider = flow.provider;
   const serverConf = MCP_OAUTH_SERVERS[provider];
+  const client = oauthClients.get(provider);
 
-  try {
-    const client = oauthClients.get(provider);
-    const tokenResp = await fetch(`${serverConf.baseUrl}/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: OAUTH_CALLBACK_URL,
-        client_id: client.client_id,
-        client_secret: client.client_secret,
-        code_verifier: flow.codeVerifier,
-      }),
-    });
+  // Send a page that does the token exchange from the browser
+  res.send(`<!DOCTYPE html><html><head><title>Connecting...</title></head><body>
+    <h2>Completing authorization...</h2><p id="status">Exchanging token...</p>
+    <script>
+    (async () => {
+      const status = document.getElementById('status');
+      try {
+        const tokenResp = await fetch('${serverConf.baseUrl}/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            grant_type: 'authorization_code',
+            code: '${code}',
+            redirect_uri: '${OAUTH_CALLBACK_URL}',
+            client_id: '${client.client_id}',
+            client_secret: '${client.client_secret}',
+            code_verifier: '${flow.codeVerifier}',
+          }),
+        });
+        if (!tokenResp.ok) throw new Error('Token exchange failed: ' + tokenResp.status);
+        const tokens = await tokenResp.json();
 
-    if (!tokenResp.ok) {
-      const errBody = await tokenResp.text();
-      throw new Error(`Token exchange failed: ${tokenResp.status} ${errBody}`);
-    }
+        const saveResp = await fetch('/api/auth/${provider}/save-tokens', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ access_token: tokens.access_token, refresh_token: tokens.refresh_token, expires_in: tokens.expires_in }),
+        });
+        const saveData = await saveResp.json();
 
-    const tokens = await tokenResp.json();
-    const session = userTokenStore.get(flow.sessionId);
-    if (session) {
-      session.tokens[provider] = {
-        accessToken: encryptToken(tokens.access_token),
-        refreshToken: tokens.refresh_token ? encryptToken(tokens.refresh_token) : null,
-        expiresAt: tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : null,
-      };
-      saveUserTokens();
-    }
-
-    res.send(`<html><body><h2>${serverConf.name} connected!</h2><script>
-      if (window.opener) { window.opener.postMessage({type:'oauth-complete',provider:'${provider}',ok:true},'*'); }
-      setTimeout(() => window.close(), 1500);
+        if (saveData.ok) {
+          status.textContent = '${serverConf.name} connected!';
+          if (window.opener) window.opener.postMessage({type:'oauth-complete',provider:'${provider}',ok:true},'*');
+        } else {
+          throw new Error(saveData.error || 'Failed to save tokens');
+        }
+      } catch (err) {
+        status.textContent = 'Error: ' + err.message;
+        if (window.opener) window.opener.postMessage({type:'oauth-complete',provider:'${provider}',ok:false},'*');
+      }
+      setTimeout(() => window.close(), 2000);
+    })();
     </script></body></html>`);
-  } catch (err) {
-    console.error('[OAUTH CALLBACK ERROR]', err.message, err.cause || '');
-    res.send(`<html><body><h2>Authorization failed</h2><p>${err.message}</p><script>
-      if (window.opener) { window.opener.postMessage({type:'oauth-complete',provider:'${provider}',ok:false,error:'${err.message}'},'*'); }
-      setTimeout(() => window.close(), 3000);
-    </script></body></html>`);
-  }
+
+  pendingOauthFlows.delete(state);
+});
+
+// Save tokens from browser-side token exchange
+app.post('/api/auth/:provider/save-tokens', (req, res) => {
+  const provider = req.params.provider;
+  const { access_token, refresh_token, expires_in } = req.body;
+  if (!access_token) return res.json({ ok: false, error: 'access_token required' });
+
+  const session = req.userSession;
+  if (!session) return res.json({ ok: false, error: 'No session' });
+
+  session.tokens[provider] = {
+    accessToken: encryptToken(access_token),
+    refreshToken: refresh_token ? encryptToken(refresh_token) : null,
+    expiresAt: expires_in ? Date.now() + expires_in * 1000 : null,
+  };
+  saveUserTokens();
+  res.json({ ok: true });
 });
 
 app.get('/api/auth/:provider/status', (req, res) => {

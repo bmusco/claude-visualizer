@@ -4270,12 +4270,10 @@ function renderSettingsModal() {
           <span class="integration-card-name">Google Workspace</span>
           <span class="integration-card-desc">Connect your Google account to give the assistant read-only access to Gmail, Calendar, Drive, Docs, Slides, and Tasks.</span>
         </div>
-        <span class="integration-badge checking" id="badge-google-workspace">${config.mcpServers.find(s => s.id === 'google-workspace') ? 'Checking...' : 'Not Configured'}</span>
+        <span class="integration-badge checking" id="badge-google-workspace">Checking...</span>
       </div>
       <div class="integration-card-actions" id="actions-google-workspace">
-        ${config.mcpServers.find(s => s.id === 'google-workspace') ? `
-          <button class="settings-action-btn connect-btn" id="connect-btn-google-workspace" onclick="connectIntegration('google-workspace', 'Google', this)">Connect Google Account</button>
-        ` : `<button class="settings-action-btn connect-btn" disabled>Not Available</button>`}
+        <button class="settings-action-btn connect-btn" id="connect-btn-google-workspace" onclick="connectIntegration('google-workspace', 'Google', this)">Connect Google Account</button>
       </div>
       <div class="settings-status-msg" id="status-google-workspace"></div>
     </div>
@@ -4290,12 +4288,10 @@ function renderSettingsModal() {
           <span class="integration-card-name">Slack</span>
           <span class="integration-card-desc">Connect your Slack account to search messages, read channels, and browse threads.</span>
         </div>
-        <span class="integration-badge checking" id="badge-slack">${config.mcpServers.find(s => s.id === 'slack') ? 'Checking...' : 'Not Configured'}</span>
+        <span class="integration-badge checking" id="badge-slack">Checking...</span>
       </div>
       <div class="integration-card-actions" id="actions-slack">
-        ${config.mcpServers.find(s => s.id === 'slack') ? `
-          <button class="settings-action-btn connect-btn" id="connect-btn-slack" onclick="connectIntegration('slack', 'Slack', this)">Connect Slack</button>
-        ` : `<button class="settings-action-btn connect-btn" disabled>Not Available</button>`}
+        <button class="settings-action-btn connect-btn" id="connect-btn-slack" onclick="connectIntegration('slack', 'Slack', this)">Connect Slack</button>
       </div>
       <div class="settings-status-msg" id="status-slack"></div>
     </div>
@@ -4310,17 +4306,13 @@ function renderSettingsModal() {
           <span class="integration-card-name">Atlassian (Jira & Confluence)</span>
           <span class="integration-card-desc">Search issues, read wiki pages, and manage tickets.</span>
         </div>
-        <span class="integration-badge checking" id="badge-atlassian">${config.mcpServers.find(s => s.id === 'atlassian') ? 'Checking...' : 'Not Configured'}</span>
+        <span class="integration-badge checking" id="badge-atlassian">Checking...</span>
       </div>
-      ${config.mcpServers.find(s => s.id === 'atlassian') ? `
-        <div class="integration-instructions">Create an API token at <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank">id.atlassian.com</a>, then enter your CMT Atlassian email and paste the token below.</div>
-        <input type="email" class="integration-field" id="atlassian-email" placeholder="you@cmtelematics.com" value="">
-        <input type="password" class="integration-field" id="atlassian-token" placeholder="API token">
-      ` : ''}
+      <div class="integration-instructions">Create an API token at <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank">id.atlassian.com</a>, then enter your CMT Atlassian email and paste the token below.</div>
+      <input type="email" class="integration-field" id="atlassian-email" placeholder="you@cmtelematics.com" value="">
+      <input type="password" class="integration-field" id="atlassian-token" placeholder="API token">
       <div class="integration-card-actions" id="actions-atlassian">
-        ${config.mcpServers.find(s => s.id === 'atlassian') ? `
-          <button class="settings-action-btn connect-btn" id="connect-btn-atlassian" onclick="saveAtlassianCredentials(this)">Save Atlassian Credentials</button>
-        ` : `<button class="settings-action-btn connect-btn" disabled>Not Available</button>`}
+        <button class="settings-action-btn connect-btn" id="connect-btn-atlassian" onclick="saveAtlassianCredentials(this)">Save Atlassian Credentials</button>
       </div>
       <div class="settings-status-msg" id="status-atlassian"></div>
     </div>
@@ -4351,6 +4343,9 @@ function renderSettingsModal() {
   </div>`;
 
   body.innerHTML = html;
+
+  // Check per-user OAuth status for integrations
+  ['google-workspace', 'slack'].forEach(checkUserAuthStatus);
 }
 
 function clearAllMemories() {

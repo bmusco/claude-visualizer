@@ -25,6 +25,7 @@ docker build --platform linux/amd64 -t "claudio:${IMAGE_TAG}" .
 log "Tagging for ECR..."
 docker tag "claudio:${IMAGE_TAG}" "${ECR_REPO}:${IMAGE_TAG}"
 docker tag "claudio:${IMAGE_TAG}" "${ECR_REPO}:latest"
+docker tag "claudio:${IMAGE_TAG}" "${ECR_REPO}:main"
 
 log "Authenticating to ECR..."
 aws ecr get-login-password --region "$AWS_REGION" \
@@ -38,6 +39,7 @@ fi
 log "Pushing ${ECR_REPO}:${IMAGE_TAG} ..."
 docker push "${ECR_REPO}:${IMAGE_TAG}"
 docker push "${ECR_REPO}:latest"
+docker push "${ECR_REPO}:main"
 
 # ── Deploy ────────────────────────────────────────────────────────
 log "Updating ECS service ${ECS_SERVICE} in cluster ${ECS_CLUSTER} (${ECS_REGION})..."

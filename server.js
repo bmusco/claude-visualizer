@@ -5,6 +5,8 @@ const { spawn, spawnSync, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
+const cookieParser = require('cookie-parser');
 
 const app = express();
 const server = http.createServer(app);
@@ -48,15 +50,302 @@ setInterval(() => {
 // CORS for split deploy (frontend on S3, API on ECS)
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', CORS_ORIGIN);
+  const origin = CORS_ORIGIN === '*' ? (req.headers.origin || '*') : CORS_ORIGIN;
+  res.header('Access-Control-Allow-Origin', origin);
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, X-Title, X-Filename');
+  res.header('Access-Control-Allow-Credentials', 'true');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
 app.use(express.json({ limit: '10mb' }));
+app.use(cookieParser());
+
+// ── Per-user session + token management ──────────────────────────
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const USER_TOKENS_FILE = path.join(__dirname, '.user-tokens.json');
+const SESSION_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+const userTokenStore = new Map();
+try {
+  const saved = JSON.parse(fs.readFileSync(USER_TOKENS_FILE, 'utf-8'));
+  for (const [sid, data] of Object.entries(saved)) {
+    if (Date.now() - (data.createdAt || 0) < SESSION_MAX_AGE) {
+      userTokenStore.set(sid, data);
+    }
+  }
+} catch {}
+
+let _tokenSaveTimer = null;
+function saveUserTokens() {
+  if (_tokenSaveTimer) clearTimeout(_tokenSaveTimer);
+  _tokenSaveTimer = setTimeout(() => {
+    const obj = {};
+    for (const [sid, data] of userTokenStore) obj[sid] = data;
+    fs.writeFile(USER_TOKENS_FILE, JSON.stringify(obj), () => {});
+  }, 500);
+}
+
+function encryptToken(text) {
+  const iv = crypto.randomBytes(16);
+  const key = crypto.scryptSync(SESSION_SECRET, 'claudio-salt', 32);
+  const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+  let encrypted = cipher.update(text, 'utf-8', 'hex');
+  encrypted += cipher.final('hex');
+  return iv.toString('hex') + ':' + encrypted;
+}
+
+function decryptToken(encrypted) {
+  try {
+    const [ivHex, data] = encrypted.split(':');
+    const iv = Buffer.from(ivHex, 'hex');
+    const key = crypto.scryptSync(SESSION_SECRET, 'claudio-salt', 32);
+    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+    let decrypted = decipher.update(data, 'hex', 'utf-8');
+    decrypted += decipher.final('utf-8');
+    return decrypted;
+  } catch { return null; }
+}
+
+// Session middleware — creates/reads claudio_sid cookie
+app.use((req, res, next) => {
+  let sid = req.cookies?.claudio_sid;
+  if (!sid || !userTokenStore.has(sid)) {
+    sid = crypto.randomBytes(24).toString('hex');
+    const cookieOpts = { httpOnly: true, maxAge: SESSION_MAX_AGE, path: '/' };
+    if (process.env.NODE_ENV === 'production') {
+      cookieOpts.secure = true;
+      cookieOpts.sameSite = 'none';
+    }
+    res.cookie('claudio_sid', sid, cookieOpts);
+    userTokenStore.set(sid, { tokens: {}, createdAt: Date.now() });
+    saveUserTokens();
+  }
+  req.sessionId = sid;
+  req.userSession = userTokenStore.get(sid);
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ── Per-user OAuth for MCP integrations ──────────────────────────
+const MCP_OAUTH_SERVERS = {
+  'google-workspace': {
+    baseUrl: 'https://portal.int-tools.cmtelematics.com/google-workspace-mcp',
+    scope: 'google-workspace',
+    name: 'Google Workspace',
+  },
+  'slack': {
+    baseUrl: 'https://portal.int-tools.cmtelematics.com/slack-mcp',
+    scope: 'slack',
+    name: 'Slack',
+  },
+};
+
+const oauthClients = new Map();
+const OAUTH_CLIENTS_FILE = path.join(__dirname, '.oauth-clients.json');
+try {
+  const saved = JSON.parse(fs.readFileSync(OAUTH_CLIENTS_FILE, 'utf-8'));
+  for (const [k, v] of Object.entries(saved)) oauthClients.set(k, v);
+} catch {}
+
+function saveOauthClients() {
+  const obj = {};
+  for (const [k, v] of oauthClients) obj[k] = v;
+  fs.writeFile(OAUTH_CLIENTS_FILE, JSON.stringify(obj), () => {});
+}
+
+const OAUTH_CALLBACK_URL = process.env.OAUTH_CALLBACK_URL ||
+  (process.env.NODE_ENV === 'production'
+    ? 'https://claudio-api.int-tools.cmtelematics.com/api/auth/callback'
+    : `http://localhost:${PORT}/api/auth/callback`);
+
+const pendingOauthFlows = new Map();
+
+async function getOrRegisterClient(provider) {
+  if (oauthClients.has(provider)) return oauthClients.get(provider);
+  const serverConf = MCP_OAUTH_SERVERS[provider];
+  if (!serverConf) throw new Error('Unknown provider');
+  const resp = await fetch(`${serverConf.baseUrl}/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_name: 'Claud-io',
+      redirect_uris: [OAUTH_CALLBACK_URL],
+      grant_types: ['authorization_code', 'refresh_token'],
+      response_types: ['code'],
+      token_endpoint_auth_method: 'client_secret_post',
+    }),
+  });
+  if (!resp.ok) throw new Error(`Registration failed: ${resp.status}`);
+  const client = await resp.json();
+  oauthClients.set(provider, client);
+  saveOauthClients();
+  return client;
+}
+
+function generatePkce() {
+  const verifier = crypto.randomBytes(32).toString('base64url');
+  const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+  return { verifier, challenge };
+}
+
+app.get('/api/auth/:provider/start', async (req, res) => {
+  const provider = req.params.provider;
+  const serverConf = MCP_OAUTH_SERVERS[provider];
+  if (!serverConf) return res.status(400).json({ ok: false, error: 'Unknown provider' });
+
+  try {
+    const client = await getOrRegisterClient(provider);
+    const pkce = generatePkce();
+    const state = crypto.randomBytes(16).toString('hex');
+
+    pendingOauthFlows.set(state, {
+      provider,
+      sessionId: req.sessionId,
+      codeVerifier: pkce.verifier,
+      createdAt: Date.now(),
+    });
+
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: client.client_id,
+      redirect_uri: OAUTH_CALLBACK_URL,
+      scope: serverConf.scope,
+      state,
+      code_challenge: pkce.challenge,
+      code_challenge_method: 'S256',
+    });
+
+    res.json({ ok: true, authUrl: `${serverConf.baseUrl}/authorize?${params}` });
+  } catch (err) {
+    res.json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/auth/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+
+  if (error) {
+    return res.send('<html><body><h2>Authorization failed</h2><p>' + error + '</p><script>window.close()</script></body></html>');
+  }
+
+  const flow = pendingOauthFlows.get(state);
+  if (!flow) {
+    return res.send('<html><body><h2>Invalid or expired state</h2><script>window.close()</script></body></html>');
+  }
+  pendingOauthFlows.delete(state);
+
+  const provider = flow.provider;
+  const serverConf = MCP_OAUTH_SERVERS[provider];
+
+  try {
+    const client = oauthClients.get(provider);
+    const tokenResp = await fetch(`${serverConf.baseUrl}/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: OAUTH_CALLBACK_URL,
+        client_id: client.client_id,
+        client_secret: client.client_secret,
+        code_verifier: flow.codeVerifier,
+      }),
+    });
+
+    if (!tokenResp.ok) {
+      const errBody = await tokenResp.text();
+      throw new Error(`Token exchange failed: ${tokenResp.status} ${errBody}`);
+    }
+
+    const tokens = await tokenResp.json();
+    const session = userTokenStore.get(flow.sessionId);
+    if (session) {
+      session.tokens[provider] = {
+        accessToken: encryptToken(tokens.access_token),
+        refreshToken: tokens.refresh_token ? encryptToken(tokens.refresh_token) : null,
+        expiresAt: tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : null,
+      };
+      saveUserTokens();
+    }
+
+    res.send(`<html><body><h2>${serverConf.name} connected!</h2><script>
+      if (window.opener) { window.opener.postMessage({type:'oauth-complete',provider:'${provider}',ok:true},'*'); }
+      setTimeout(() => window.close(), 1500);
+    </script></body></html>`);
+  } catch (err) {
+    console.error('[OAUTH ERROR]', err.message);
+    res.send(`<html><body><h2>Authorization failed</h2><p>${err.message}</p><script>window.close()</script></body></html>`);
+  }
+});
+
+app.get('/api/auth/:provider/status', (req, res) => {
+  const provider = req.params.provider;
+  const session = req.userSession;
+  const tokenData = session?.tokens?.[provider];
+  if (!tokenData?.accessToken) return res.json({ ok: false, connected: false });
+
+  const expired = tokenData.expiresAt && Date.now() > tokenData.expiresAt;
+  res.json({ ok: true, connected: !expired, hasRefreshToken: !!tokenData.refreshToken });
+});
+
+app.post('/api/auth/:provider/disconnect', (req, res) => {
+  const provider = req.params.provider;
+  if (req.userSession?.tokens?.[provider]) {
+    delete req.userSession.tokens[provider];
+    saveUserTokens();
+  }
+  res.json({ ok: true });
+});
+
+// Helper: get decrypted access token for current user + provider
+function getUserMcpToken(req, provider) {
+  const tokenData = req.userSession?.tokens?.[provider];
+  if (!tokenData?.accessToken) return null;
+  if (tokenData.expiresAt && Date.now() > tokenData.expiresAt) return null;
+  return decryptToken(tokenData.accessToken);
+}
+
+// Helper: refresh expired token
+async function refreshUserToken(sessionId, provider) {
+  const session = userTokenStore.get(sessionId);
+  const tokenData = session?.tokens?.[provider];
+  if (!tokenData?.refreshToken) return null;
+
+  const serverConf = MCP_OAUTH_SERVERS[provider];
+  const client = oauthClients.get(provider);
+  if (!serverConf || !client) return null;
+
+  try {
+    const resp = await fetch(`${serverConf.baseUrl}/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: decryptToken(tokenData.refreshToken),
+        client_id: client.client_id,
+        client_secret: client.client_secret,
+      }),
+    });
+    if (!resp.ok) return null;
+    const tokens = await resp.json();
+    tokenData.accessToken = encryptToken(tokens.access_token);
+    if (tokens.refresh_token) tokenData.refreshToken = encryptToken(tokens.refresh_token);
+    tokenData.expiresAt = tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : null;
+    saveUserTokens();
+    return tokens.access_token;
+  } catch { return null; }
+}
+
+// Periodically clean up expired pending flows
+setInterval(() => {
+  const now = Date.now();
+  for (const [state, flow] of pendingOauthFlows) {
+    if (now - flow.createdAt > 10 * 60 * 1000) pendingOauthFlows.delete(state);
+  }
+}, 60 * 1000);
 
 // Health check
 app.get('/health', (req, res) => res.json({ ok: true }));
@@ -597,6 +886,19 @@ let mcpAccessToken = null;
 let directMcpAvailable = false;
 
 function loadMcpTokensFromKeychain() {
+  // Try per-user token store first (container-friendly)
+  try {
+    const credFile = path.join(os.homedir(), '.claude', 'mcp-credentials.json');
+    const creds = JSON.parse(fs.readFileSync(credFile, 'utf-8'));
+    const gw = Object.values(creds.mcpOAuth || {}).find(
+      v => v.serverName === 'google-workspace'
+    );
+    if (gw?.accessToken) {
+      mcpAccessToken = gw.accessToken;
+      return true;
+    }
+  } catch {}
+  // Fallback: macOS keychain (local dev only)
   try {
     const result = execSync(
       'security find-generic-password -s "Claude Code-credentials" -g 2>&1',
@@ -614,38 +916,32 @@ function loadMcpTokensFromKeychain() {
   } catch { return false; }
 }
 
-// Stateless MCP tool call — server doesn't require sessions
-function mcpCallTool(toolName, args) {
+// MCP tool call with explicit token (for per-user OAuth)
+function mcpCallToolWithToken(toolName, args, token, mcpUrl) {
   const https = require('https');
+  const url = mcpUrl || MCP_GOOGLE_URL;
   return new Promise((resolve) => {
     const body = JSON.stringify({
       jsonrpc: '2.0', method: 'tools/call', id: Date.now(),
       params: { name: toolName, arguments: args }
     });
-    const req = https.request(MCP_GOOGLE_URL, {
+    const req = https.request(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json, text/event-stream',
-        'Authorization': `Bearer ${mcpAccessToken}`,
+        'Authorization': `Bearer ${token}`,
       }
     }, (res) => {
       if (res.statusCode === 401 || res.statusCode === 403) {
-        // Token expired — reload from keychain (Claude CLI may have refreshed it)
         res.resume();
-        if (loadMcpTokensFromKeychain()) {
-          mcpCallTool(toolName, args).then(resolve);
-        } else {
-          directMcpAvailable = false;
-          resolve(null);
-        }
+        resolve(null);
         return;
       }
       let data = '';
       res.on('data', c => { data += c; });
       res.on('end', () => {
         try {
-          // SSE format: event: message\ndata: {...}\n\n
           const dataMatch = data.match(/^data:\s*(.+)$/m);
           if (dataMatch) { resolve(JSON.parse(dataMatch[1])); return; }
           resolve(JSON.parse(data));
@@ -656,6 +952,16 @@ function mcpCallTool(toolName, args) {
     req.setTimeout(15000, () => { req.destroy(); resolve(null); });
     req.write(body);
     req.end();
+  });
+}
+
+// Backward-compatible wrapper using global token (shared/fallback)
+function mcpCallTool(toolName, args) {
+  return mcpCallToolWithToken(toolName, args, mcpAccessToken).then(result => {
+    if (result === null && loadMcpTokensFromKeychain()) {
+      return mcpCallToolWithToken(toolName, args, mcpAccessToken);
+    }
+    return result;
   });
 }
 

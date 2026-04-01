@@ -109,26 +109,43 @@ function renderSettingsDropdown(config) {
     </div>`;
   }
 
-  // MCP Servers with test + re-auth
-  if (config.mcpServers.length > 0) {
+  // Per-user OAuth integrations (always show — auth is per-user, not server-wide)
+  const oauthIntegrations = [
+    { id: 'google-workspace', name: 'Google Workspace', shortName: 'Google', desc: 'Connect your Google account to give the assistant read-only access to Gmail, Calendar, Drive, Docs, Slides, and Tasks.' },
+    { id: 'slack', name: 'Slack', shortName: 'Slack', desc: 'Connect your Slack account to search messages, read channels, and browse threads.' },
+  ];
+  html += `<div class="settings-section">
+    <div class="settings-section-title">Integrations</div>
+    ${oauthIntegrations.map(s => `
+    <div class="settings-server-card" id="server-${s.id}">
+      <div class="settings-item" style="align-items:flex-start">
+        <div>
+          <span class="item-label">${escapeHtml(s.name)}</span>
+          <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${s.desc}</div>
+        </div>
+        <span class="integration-badge disconnected" id="badge-${s.id}">Checking...</span>
+      </div>
+      <div class="settings-auth-actions">
+        <button class="settings-action-btn" id="connect-btn-${s.id}" onclick="connectIntegration('${s.id}', '${s.shortName}', this)">Connect ${s.shortName}</button>
+      </div>
+      <div class="settings-status-msg" id="status-${s.id}"></div>
+    </div>`).join('')}
+  </div>`;
+
+  // Atlassian (API token, not OAuth)
+  if (config.mcpServers.some(s => s.id === 'atlassian')) {
     html += `<div class="settings-section">
-      <div class="settings-section-title">Integrations</div>
-      ${config.mcpServers.map(s => {
-        const serverId = s.id || '';
-        return `
-        <div class="settings-server-card" id="server-${serverId}">
-          <div class="settings-item">
-            <span class="status-dot" id="dot-${serverId}"></span>
-            <span class="item-label">${escapeHtml(s.name)}</span>
-            <span class="item-detail">${s.tools} tool${s.tools !== 1 ? 's' : ''}</span>
-          </div>
-          ${serverId ? `<div class="settings-auth-actions">
-            <button class="settings-action-btn" onclick="testMcpConnection('${serverId}', this)">Test</button>
-            <button class="settings-action-btn" onclick="reauthMcp('${serverId}', this)">Re-authenticate</button>
-          </div>
-          <div class="settings-status-msg" id="status-${serverId}"></div>` : ''}
-        </div>`;
-      }).join('')}
+      <div class="settings-section-title">Atlassian</div>
+      <div class="settings-server-card" id="server-atlassian">
+        <div class="settings-item">
+          <span class="item-label">Jira & Confluence</span>
+          <span class="integration-badge disconnected" id="badge-atlassian">Not Connected</span>
+        </div>
+        <div class="settings-auth-actions">
+          <button class="settings-action-btn" onclick="testMcpConnection('atlassian', this)">Test</button>
+        </div>
+        <div class="settings-status-msg" id="status-atlassian"></div>
+      </div>
     </div>`;
   }
 
@@ -150,6 +167,9 @@ function renderSettingsDropdown(config) {
   </div>`;
 
   dd.innerHTML = html;
+
+  // Check per-user OAuth status for each integration
+  ['google-workspace', 'slack'].forEach(checkUserAuthStatus);
 }
 
 function testMcpConnection(serverId, btn) {
@@ -160,7 +180,7 @@ function testMcpConnection(serverId, btn) {
   if (badge) { badge.textContent = 'Checking...'; badge.className = 'integration-badge checking'; }
   if (statusMsg) { statusMsg.textContent = ''; statusMsg.className = 'settings-status-msg'; }
 
-  fetch(`${API_BASE}/api/config/test/${serverId}`, { method: 'POST' })
+  fetch(`${API_BASE}/api/config/test/${serverId}`, { method: 'POST', credentials: 'include' })
     .then(r => r.json())
     .then(data => {
       if (badge) { badge.textContent = data.ok ? 'Connected' : 'Not Connected'; badge.className = 'integration-badge ' + (data.ok ? 'connected' : 'disconnected'); }
@@ -202,7 +222,7 @@ function reauthMcp(serverId, btn) {
   const statusMsg = document.getElementById('status-' + serverId);
   if (statusMsg) { statusMsg.textContent = 'Starting re-authentication...'; statusMsg.className = 'settings-status-msg'; }
 
-  fetch(`${API_BASE}/api/config/reauth/${serverId}`, { method: 'POST' })
+  fetch(`${API_BASE}/api/config/reauth/${serverId}`, { method: 'POST', credentials: 'include' })
     .then(r => r.json())
     .then(data => {
       btn.textContent = origText;
@@ -227,33 +247,64 @@ function connectIntegration(serverId, shortName, btn) {
   btn.textContent = 'Connecting...';
   btn.disabled = true;
   if (badge) { badge.textContent = 'Connecting...'; badge.className = 'integration-badge checking'; }
-  if (statusMsg) { statusMsg.textContent = 'Opening sign-in in your browser...'; statusMsg.className = 'settings-status-msg'; }
+  if (statusMsg) { statusMsg.textContent = 'Opening sign-in...'; statusMsg.className = 'settings-status-msg'; }
 
-  fetch(`${API_BASE}/api/integrations/connect/${serverId}`, { method: 'POST' })
+  fetch(`${API_BASE}/api/auth/${serverId}/start`, { credentials: 'include' })
     .then(r => r.json())
     .then(data => {
-      if (statusMsg) { statusMsg.textContent = 'Complete the sign-in in your browser, then click "Check Connection" below.'; statusMsg.className = 'settings-status-msg'; }
-      btn.textContent = 'Check Connection';
-      btn.disabled = false;
-      btn.onclick = () => {
-        btn.textContent = 'Checking...';
-        btn.disabled = true;
-        if (statusMsg) { statusMsg.textContent = ''; }
-        testMcpConnection(serverId, null);
-        // Restore button after test completes
-        setTimeout(() => {
-          btn.textContent = `Connect ${shortName} Account`;
+      if (!data.ok || !data.authUrl) {
+        throw new Error(data.error || 'Failed to start auth');
+      }
+      const popup = window.open(data.authUrl, `oauth-${serverId}`, 'width=600,height=700,popup=yes');
+
+      const onMessage = (event) => {
+        if (event.data?.type === 'oauth-complete' && event.data?.provider === serverId) {
+          window.removeEventListener('message', onMessage);
+          btn.textContent = `Connect ${shortName}`;
           btn.disabled = false;
-          btn.onclick = () => connectIntegration(serverId, shortName, btn);
-        }, 35000);
+          if (event.data.ok) {
+            if (badge) { badge.textContent = 'Connected'; badge.className = 'integration-badge connected'; }
+            if (statusMsg) { statusMsg.textContent = 'Successfully connected!'; statusMsg.className = 'settings-status-msg ok'; }
+          } else {
+            if (badge) { badge.textContent = 'Not Connected'; badge.className = 'integration-badge disconnected'; }
+            if (statusMsg) { statusMsg.textContent = 'Authorization failed'; statusMsg.className = 'settings-status-msg err'; }
+          }
+        }
       };
+      window.addEventListener('message', onMessage);
+
+      const pollClosed = setInterval(() => {
+        if (popup && popup.closed) {
+          clearInterval(pollClosed);
+          btn.textContent = `Connect ${shortName}`;
+          btn.disabled = false;
+          checkUserAuthStatus(serverId);
+        }
+      }, 1000);
     })
-    .catch(() => {
-      btn.textContent = `Connect ${shortName} Account`;
+    .catch((err) => {
+      btn.textContent = `Connect ${shortName}`;
       btn.disabled = false;
       if (badge) { badge.textContent = 'Error'; badge.className = 'integration-badge disconnected'; }
-      if (statusMsg) { statusMsg.textContent = 'Connection failed'; statusMsg.className = 'settings-status-msg err'; }
+      if (statusMsg) { statusMsg.textContent = err.message || 'Connection failed'; statusMsg.className = 'settings-status-msg err'; }
     });
+}
+
+function checkUserAuthStatus(serverId) {
+  const badge = document.getElementById('badge-' + serverId);
+  const statusMsg = document.getElementById('status-' + serverId);
+  fetch(`${API_BASE}/api/auth/${serverId}/status`, { credentials: 'include' })
+    .then(r => r.json())
+    .then(data => {
+      if (badge) {
+        badge.textContent = data.connected ? 'Connected' : 'Not Connected';
+        badge.className = 'integration-badge ' + (data.connected ? 'connected' : 'disconnected');
+      }
+      if (statusMsg && data.connected) {
+        statusMsg.textContent = '';
+      }
+    })
+    .catch(() => {});
 }
 
 function saveAtlassianCredentials(btn) {

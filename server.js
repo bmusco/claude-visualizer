@@ -148,7 +148,10 @@ const OAUTH_CLIENTS_FILE = path.join(__dirname, '.oauth-clients.json');
 try {
   const saved = JSON.parse(fs.readFileSync(OAUTH_CLIENTS_FILE, 'utf-8'));
   for (const [k, v] of Object.entries(saved)) oauthClients.set(k, v);
-} catch {}
+  console.log(`[OAUTH] Loaded ${oauthClients.size} OAuth clients from ${OAUTH_CLIENTS_FILE}`);
+} catch (e) {
+  console.log(`[OAUTH] No pre-registered clients at ${OAUTH_CLIENTS_FILE}: ${e.message}`);
+}
 
 function saveOauthClients() {
   const obj = {};

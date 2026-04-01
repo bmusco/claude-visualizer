@@ -27,6 +27,8 @@ resource "aws_ecs_task_definition" "service" {
         }
       ]
       essential   = true
+      entryPoint  = ["/app/entrypoint.sh"]
+      command     = ["node", "server.js"]
       environment = [
         { name = "PORT", value = tostring(var.container-port) },
         { name = "CORS_ORIGIN", value = var.frontend-url },

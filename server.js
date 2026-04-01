@@ -11,7 +11,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 3333;
-const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || '/Users/bmusco/.local/bin/claude';
+const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || 'claude';
 const USER_HOME = process.env.CLAUDIO_HOME || os.homedir();
 
 // ── MCP integration test commands (shared across endpoints) ─────

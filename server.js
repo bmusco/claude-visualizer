@@ -1277,6 +1277,84 @@ const SYSTEM_PROMPT = fs.readFileSync(path.join(__dirname, 'system-prompt.md'), 
 
 // ── MCP intent detection + pre-fetch ─────────────────────────────
 const MCP_GOOGLE_BASE = 'https://portal.int-tools.cmtelematics.com/google-workspace-mcp/mcp';
+const MCP_SLACK_BASE = 'https://portal.int-tools.cmtelematics.com/slack-mcp/mcp';
+
+// Slack MCP session manager (stateful — requires initialize handshake)
+const slackSessions = new Map(); // token hash -> { sessionId, createdAt }
+const SLACK_SESSION_TTL = 30 * 60 * 1000;
+
+async function getSlackSession(accessToken) {
+  const tokenHash = crypto.createHash('md5').update(accessToken).digest('hex');
+  const cached = slackSessions.get(tokenHash);
+  if (cached && Date.now() - cached.createdAt < SLACK_SESSION_TTL) return cached.sessionId;
+
+  try {
+    const https = require('https');
+    const sessionId = await new Promise((resolve, reject) => {
+      const body = JSON.stringify({
+        jsonrpc: '2.0', method: 'initialize', id: 1,
+        params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'claudio', version: '1.0' } }
+      });
+      const req = https.request(MCP_SLACK_BASE, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/event-stream',
+          'Authorization': `Bearer ${accessToken}`,
+        }
+      }, (res) => {
+        const sid = res.headers['mcp-session-id'];
+        let data = '';
+        res.on('data', c => { data += c; });
+        res.on('end', () => { sid ? resolve(sid) : reject(new Error('No session ID')); });
+      });
+      req.on('error', reject);
+      req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
+      req.write(body);
+      req.end();
+    });
+
+    slackSessions.set(tokenHash, { sessionId, createdAt: Date.now() });
+    return sessionId;
+  } catch (err) {
+    console.error('[SLACK MCP] Session init failed:', err.message);
+    return null;
+  }
+}
+
+function slackMcpCallTool(toolName, args, accessToken, sessionId) {
+  const https = require('https');
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      jsonrpc: '2.0', method: 'tools/call', id: Date.now(),
+      params: { name: toolName, arguments: args }
+    });
+    const req = https.request(MCP_SLACK_BASE, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        'Authorization': `Bearer ${accessToken}`,
+        'mcp-session-id': sessionId,
+      }
+    }, (res) => {
+      if (res.statusCode === 401 || res.statusCode === 403) { res.resume(); resolve(null); return; }
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        try {
+          const dataMatch = data.match(/^data:\s*(.+)$/m);
+          if (dataMatch) { resolve(JSON.parse(dataMatch[1])); return; }
+          resolve(JSON.parse(data));
+        } catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
+    req.write(body);
+    req.end();
+  });
+}
 
 function detectMcpIntent(prompt) {
   const lower = prompt.toLowerCase();
@@ -1313,22 +1391,55 @@ function detectMcpIntent(prompt) {
     }
   }
 
+  if (/\b(slack|channel|#\w+)\b/.test(lower)) {
+    if (/\b(search\s+slack|slack\s+for|find\s+(?:in\s+)?slack)\b/.test(lower)) {
+      const queryMatch = lower.match(/(?:search\s+slack\s+for|slack\s+for|find\s+in\s+slack)\s+"?([^"]+)"?/);
+      const query = queryMatch ? queryMatch[1].trim() : lower.replace(/\b(search|slack|for|find|in)\b/g, '').trim();
+      intents.push({ provider: 'slack', tool: 'slack_search', args: { query, max_results: 10 }, label: 'Searching Slack...' });
+    } else if (/\b(read|check|what'?s?\s+(?:in|on|happening))\b/.test(lower)) {
+      const channelMatch = lower.match(/#(\w[\w-]*)/);
+      if (channelMatch) {
+        intents.push({ provider: 'slack', tool: 'slack_read_channel', args: { channel: channelMatch[1], max_results: 20 }, label: `Reading #${channelMatch[1]}...` });
+      } else {
+        intents.push({ provider: 'slack', tool: 'slack_list_channels', args: { max_results: 20 }, label: 'Listing Slack channels...' });
+      }
+    } else {
+      const query = lower.replace(/\b(slack|about|what|tell|me)\b/g, '').trim();
+      if (query.length > 2) {
+        intents.push({ provider: 'slack', tool: 'slack_search', args: { query, max_results: 10 }, label: 'Searching Slack...' });
+      }
+    }
+  }
+
   return intents;
 }
 
-async function executeMcpPreFetch(intents, userToken) {
-  if (!userToken || intents.length === 0) return [];
+async function executeMcpPreFetch(intents, googleToken, slackToken) {
+  if (intents.length === 0) return [];
   const results = [];
   for (const intent of intents) {
     try {
-      const mcpUrl = MCP_GOOGLE_BASE;
-      const result = await mcpCallToolWithToken(intent.tool, intent.args, userToken, mcpUrl);
-      if (result?.result?.content) {
-        let text = '';
-        for (const item of result.result.content) {
-          if (item.type === 'text') text += item.text;
+      if (intent.provider === 'google-workspace' && googleToken) {
+        const result = await mcpCallToolWithToken(intent.tool, intent.args, googleToken, MCP_GOOGLE_BASE);
+        if (result?.result?.content) {
+          let text = '';
+          for (const item of result.result.content) {
+            if (item.type === 'text') text += item.text;
+          }
+          if (text) results.push({ tool: intent.tool, data: text });
         }
-        if (text) results.push({ tool: intent.tool, data: text });
+      } else if (intent.provider === 'slack' && slackToken) {
+        const sessionId = await getSlackSession(slackToken);
+        if (sessionId) {
+          const result = await slackMcpCallTool(intent.tool, intent.args, slackToken, sessionId);
+          if (result?.result?.content) {
+            let text = '';
+            for (const item of result.result.content) {
+              if (item.type === 'text') text += item.text;
+            }
+            if (text) results.push({ tool: intent.tool, data: text });
+          }
+        }
       }
     } catch (err) {
       console.error(`[MCP PRE-FETCH] ${intent.tool} failed:`, err.message);
@@ -1469,14 +1580,16 @@ wss.on('connection', (ws, req) => {
       let mcpPreFetched = false;
       const mcpIntents = detectMcpIntent(userMessage);
       if (mcpIntents.length > 0 && ws.userSession) {
-        const googleToken = ws.userSession.tokens?.['google-workspace'];
-        let accessToken = googleToken?.accessToken ? decryptToken(googleToken.accessToken) : null;
+        const googleTokenData = ws.userSession.tokens?.['google-workspace'];
+        const slackTokenData = ws.userSession.tokens?.['slack'];
+        const googleToken = googleTokenData?.accessToken ? decryptToken(googleTokenData.accessToken) : null;
+        const slackToken = slackTokenData?.accessToken ? decryptToken(slackTokenData.accessToken) : null;
 
-        if (accessToken) {
+        if (googleToken || slackToken) {
           for (const intent of mcpIntents) {
             ws.send(JSON.stringify({ action: 'chat-status', text: intent.label }));
           }
-          const fetchResults = await executeMcpPreFetch(mcpIntents, accessToken);
+          const fetchResults = await executeMcpPreFetch(mcpIntents, googleToken, slackToken);
           if (fetchResults.length > 0) {
             mcpPreFetched = true;
             const dataBlock = fetchResults.map(r =>

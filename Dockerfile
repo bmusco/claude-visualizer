@@ -11,7 +11,7 @@ RUN curl -fsSL https://storage.googleapis.com/anthropic-sdk/claude-code/claude-c
     && chmod +x /usr/local/bin/claude \
     || echo "WARN: Claude CLI install failed — update URL in Dockerfile"
 
-RUN useradd -m -u 1000 appuser
+RUN useradd -m appuser || true
 
 WORKDIR /app
 

@@ -8,3 +8,4 @@ node_modules/
 .claude/*
 !.claude/skills/
 .mcp.json
+sidecar/pgproxy/cmtpgproxy-linux-amd64

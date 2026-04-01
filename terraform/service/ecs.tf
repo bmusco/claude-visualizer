@@ -56,6 +56,36 @@ resource "aws_ecs_task_definition" "service" {
         retries     = 3
         startPeriod = 10
       }
+    },
+    {
+      name      = "pgproxy"
+      image     = "${var.container-registry}/${var.service-repo-prefix}/claudio-pgproxy:main"
+      essential = false
+      portMappings = [
+        {
+          hostPort      = 13626
+          protocol      = "tcp"
+          containerPort = 13626
+        }
+      ]
+      environment = [
+        { name = "AWS_DEFAULT_REGION", value = var.region },
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.service.name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "pgproxy"
+        }
+      }
+      healthCheck = {
+        command     = ["CMD-SHELL", "test -f /usr/local/bin/cmtpgproxy"]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 10
+      }
     }
   ])
 

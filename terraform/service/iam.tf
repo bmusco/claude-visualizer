@@ -27,6 +27,56 @@ data "aws_iam_policy_document" "task-policy" {
     ]
     resources = ["*"]
   }
+
+  statement {
+    sid = "SSMSessionManager"
+    actions = [
+      "ssm:StartSession",
+      "ssm:TerminateSession",
+      "ssm:ResumeSession",
+      "ssm:DescribeSessions",
+      "ssm:GetConnectionStatus",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "SSMMessages"
+    actions = [
+      "ssmmessages:CreateControlChannel",
+      "ssmmessages:CreateDataChannel",
+      "ssmmessages:OpenControlChannel",
+      "ssmmessages:OpenDataChannel",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "RedshiftCredentials"
+    actions = [
+      "redshift:GetClusterCredentials",
+      "redshift:GetClusterCredentialsWithIAM",
+      "redshift:DescribeClusters",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "EC2DescribeForGateway"
+    actions = [
+      "ec2:DescribeInstances",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "STSAssumeRole"
+    actions = [
+      "sts:AssumeRole",
+      "sts:GetCallerIdentity",
+    ]
+    resources = ["*"]
+  }
 }
 
 data "aws_iam_policy_document" "task-execution-policy" {

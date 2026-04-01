@@ -20,10 +20,20 @@ resource "aws_security_group_rule" "in-elb-http" {
 }
 
 resource "aws_security_group_rule" "container-out-https" {
-  description       = "${var.service-name} egress for HTTPS (Bedrock, ECR, Secrets Manager)"
+  description       = "${var.service-name} egress for HTTPS (Bedrock, ECR, SSM, Secrets Manager)"
   type              = "egress"
   from_port         = 443
   to_port           = 443
+  protocol          = "tcp"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.task.id
+}
+
+resource "aws_security_group_rule" "container-out-redshift" {
+  description       = "${var.service-name} egress for Redshift (via SSM tunnel)"
+  type              = "egress"
+  from_port         = 5439
+  to_port           = 5439
   protocol          = "tcp"
   cidr_blocks       = ["0.0.0.0/0"]
   security_group_id = aws_security_group.task.id

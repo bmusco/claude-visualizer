@@ -197,7 +197,15 @@ app.get('/api/auth/:provider/start', async (req, res) => {
   if (!serverConf) return res.status(400).json({ ok: false, error: 'Unknown provider' });
 
   try {
-    const client = await getOrRegisterClient(provider);
+    let client = oauthClients.get(provider);
+    if (!client) {
+      try {
+        client = await getOrRegisterClient(provider);
+      } catch (regErr) {
+        return res.json({ ok: false, error: `OAuth client not registered and registration failed: ${regErr.message}. Pre-register clients via the entrypoint config.` });
+      }
+    }
+
     const pkce = generatePkce();
     const state = crypto.randomBytes(16).toString('hex');
 
@@ -220,6 +228,7 @@ app.get('/api/auth/:provider/start', async (req, res) => {
 
     res.json({ ok: true, authUrl: `${serverConf.baseUrl}/authorize?${params}` });
   } catch (err) {
+    console.error('[OAUTH START ERROR]', provider, err.message, err.cause || '');
     res.json({ ok: false, error: err.message });
   }
 });
@@ -276,8 +285,11 @@ app.get('/api/auth/callback', async (req, res) => {
       setTimeout(() => window.close(), 1500);
     </script></body></html>`);
   } catch (err) {
-    console.error('[OAUTH ERROR]', err.message);
-    res.send(`<html><body><h2>Authorization failed</h2><p>${err.message}</p><script>window.close()</script></body></html>`);
+    console.error('[OAUTH CALLBACK ERROR]', err.message, err.cause || '');
+    res.send(`<html><body><h2>Authorization failed</h2><p>${err.message}</p><script>
+      if (window.opener) { window.opener.postMessage({type:'oauth-complete',provider:'${provider}',ok:false,error:'${err.message}'},'*'); }
+      setTimeout(() => window.close(), 3000);
+    </script></body></html>`);
   }
 });
 

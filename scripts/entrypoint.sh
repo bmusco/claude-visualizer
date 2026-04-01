@@ -17,6 +17,12 @@ if [ -n "$CLAUDE_CONFIG_TAR_B64" ] && [ "$CLAUDE_CONFIG_TAR_B64" != "placeholder
     cp "$HOME/.mcp.json" /app/.mcp.json 2>/dev/null || true
     echo "[entrypoint] .mcp.json restored"
   fi
+
+  # Restore OAuth client registrations
+  if [ -f "$HOME/.oauth-clients.json" ]; then
+    cp "$HOME/.oauth-clients.json" /app/.oauth-clients.json 2>/dev/null || true
+    echo "[entrypoint] OAuth clients restored"
+  fi
 fi
 
 exec "$@"

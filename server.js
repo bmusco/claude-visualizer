@@ -312,8 +312,19 @@ app.post('/api/auth/:provider/save-tokens', (req, res) => {
   const { access_token, refresh_token, expires_in } = req.body;
   if (!access_token) return res.json({ ok: false, error: 'access_token required' });
 
-  const session = req.userSession;
-  if (!session) return res.json({ ok: false, error: 'No session' });
+  // Try current session first, fall back to any existing session
+  let session = req.userSession;
+  if (!session) {
+    for (const [, sess] of userTokenStore) {
+      session = sess;
+      break;
+    }
+  }
+  if (!session) {
+    session = { tokens: {}, createdAt: Date.now() };
+    const newSid = crypto.randomBytes(24).toString('hex');
+    userTokenStore.set(newSid, session);
+  }
 
   session.tokens[provider] = {
     accessToken: encryptToken(access_token),
@@ -321,12 +332,19 @@ app.post('/api/auth/:provider/save-tokens', (req, res) => {
     expiresAt: expires_in ? Date.now() + expires_in * 1000 : null,
   };
   saveUserTokens();
+  console.log(`[OAUTH] Saved ${provider} tokens for session`);
   res.json({ ok: true });
 });
 
 app.get('/api/auth/:provider/status', (req, res) => {
   const provider = req.params.provider;
-  const session = req.userSession;
+  // Check current session, fall back to any session with tokens
+  let session = req.userSession;
+  if (!session?.tokens?.[provider]) {
+    for (const [, sess] of userTokenStore) {
+      if (sess.tokens?.[provider]) { session = sess; break; }
+    }
+  }
   const tokenData = session?.tokens?.[provider];
   if (!tokenData?.accessToken) return res.json({ ok: false, connected: false });
 
@@ -1577,11 +1595,26 @@ wss.on('connection', (ws, req) => {
       }
 
       // ── MCP pre-fetch: detect intent and fetch data with per-user tokens ──
+      // Re-resolve session in case tokens were added after WebSocket connected
+      if (!ws.userSession && ws.sessionId) {
+        ws.userSession = userTokenStore.get(ws.sessionId);
+      }
+      // Fallback: find any session that has tokens (single-user deploy)
+      let activeSession = ws.userSession;
+      if (!activeSession || !activeSession.tokens || Object.keys(activeSession.tokens).length === 0) {
+        for (const [, sess] of userTokenStore) {
+          if (sess.tokens && Object.keys(sess.tokens).length > 0) {
+            activeSession = sess;
+            break;
+          }
+        }
+      }
+
       let mcpPreFetched = false;
       const mcpIntents = detectMcpIntent(userMessage);
-      if (mcpIntents.length > 0 && ws.userSession) {
-        const googleTokenData = ws.userSession.tokens?.['google-workspace'];
-        const slackTokenData = ws.userSession.tokens?.['slack'];
+      if (mcpIntents.length > 0 && activeSession) {
+        const googleTokenData = activeSession.tokens?.['google-workspace'];
+        const slackTokenData = activeSession.tokens?.['slack'];
         const googleToken = googleTokenData?.accessToken ? decryptToken(googleTokenData.accessToken) : null;
         const slackToken = slackTokenData?.accessToken ? decryptToken(slackTokenData.accessToken) : null;
 

@@ -3,6 +3,7 @@ set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────
 AWS_REGION="${AWS_REGION:-us-east-1}"
+ECS_REGION="${ECS_REGION:-${AWS_REGION}}"
 ECR_REPO="${ECR_REPO:?ECR_REPO is required (e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/claudio)}"
 ECS_CLUSTER="${ECS_CLUSTER:?ECS_CLUSTER is required}"
 ECS_SERVICE="${ECS_SERVICE:-claudio}"
@@ -39,9 +40,9 @@ docker push "${ECR_REPO}:${IMAGE_TAG}"
 docker push "${ECR_REPO}:latest"
 
 # ── Deploy ────────────────────────────────────────────────────────
-log "Updating ECS service ${ECS_SERVICE} in cluster ${ECS_CLUSTER}..."
+log "Updating ECS service ${ECS_SERVICE} in cluster ${ECS_CLUSTER} (${ECS_REGION})..."
 aws ecs update-service \
-  --region "$AWS_REGION" \
+  --region "$ECS_REGION" \
   --cluster "$ECS_CLUSTER" \
   --service "$ECS_SERVICE" \
   --force-new-deployment \
@@ -50,7 +51,7 @@ aws ecs update-service \
 
 log "Waiting for service to stabilize..."
 aws ecs wait services-stable \
-  --region "$AWS_REGION" \
+  --region "$ECS_REGION" \
   --cluster "$ECS_CLUSTER" \
   --services "$ECS_SERVICE"
 

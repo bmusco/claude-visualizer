@@ -129,16 +129,27 @@ app.use((req, res, next) => {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ── Per-user OAuth for MCP integrations ──────────────────────────
-const MCP_OAUTH_SERVERS = {
+// ── Per-user OAuth — direct Google/Slack (no MCP proxy) ──────────
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const SLACK_CLIENT_ID_OAUTH = process.env.SLACK_CLIENT_ID_OAUTH || '';
+const SLACK_CLIENT_SECRET_OAUTH = process.env.SLACK_CLIENT_SECRET_OAUTH || '';
+
+const DIRECT_OAUTH_PROVIDERS = {
   'google-workspace': {
-    baseUrl: 'https://portal.int-tools.cmtelematics.com/google-workspace-mcp',
-    scope: 'google-workspace',
+    authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    clientId: GOOGLE_CLIENT_ID,
+    clientSecret: GOOGLE_CLIENT_SECRET,
+    scope: 'https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/tasks.readonly',
     name: 'Google Workspace',
   },
   'slack': {
-    baseUrl: 'https://portal.int-tools.cmtelematics.com/slack-mcp',
-    scope: 'slack',
+    authUrl: 'https://slack.com/oauth/v2/authorize',
+    tokenUrl: 'https://slack.com/api/oauth.v2.access',
+    clientId: SLACK_CLIENT_ID_OAUTH,
+    clientSecret: SLACK_CLIENT_SECRET_OAUTH,
+    scope: 'search:read,channels:read,groups:read,im:read,mpim:read,users:read',
     name: 'Slack',
   },
 };
@@ -201,48 +212,42 @@ function generatePkce() {
 
 app.get('/api/auth/:provider/start', async (req, res) => {
   const provider = req.params.provider;
-  const serverConf = MCP_OAUTH_SERVERS[provider];
-  if (!serverConf) return res.status(400).json({ ok: false, error: 'Unknown provider' });
+  const providerConf = DIRECT_OAUTH_PROVIDERS[provider];
+  if (!providerConf) return res.status(400).json({ ok: false, error: 'Unknown provider' });
 
   try {
-    let client = oauthClients.get(provider);
-    if (!client) {
-      try {
-        client = await getOrRegisterClient(provider);
-      } catch (regErr) {
-        return res.json({ ok: false, error: `OAuth client not registered and registration failed: ${regErr.message}. Pre-register clients via the entrypoint config.` });
-      }
-    }
-
-    const pkce = generatePkce();
     const state = crypto.randomBytes(16).toString('hex');
 
     pendingOauthFlows.set(state, {
       provider,
       sessionId: req.sessionId,
-      codeVerifier: pkce.verifier,
       createdAt: Date.now(),
     });
 
     const params = new URLSearchParams({
       response_type: 'code',
-      client_id: client.client_id,
+      client_id: providerConf.clientId,
       redirect_uri: OAUTH_CALLBACK_URL,
-      scope: serverConf.scope,
+      scope: providerConf.scope,
       state,
-      code_challenge: pkce.challenge,
-      code_challenge_method: 'S256',
+      access_type: 'offline',
+      prompt: 'consent',
     });
 
-    res.json({ ok: true, authUrl: `${serverConf.baseUrl}/authorize?${params}` });
+    // Slack uses slightly different param names
+    if (provider === 'slack') {
+      params.delete('scope');
+      params.set('user_scope', providerConf.scope);
+    }
+
+    res.json({ ok: true, authUrl: `${providerConf.authUrl}?${params}` });
   } catch (err) {
-    console.error('[OAUTH START ERROR]', provider, err.message, err.cause || '');
+    console.error('[OAUTH START ERROR]', provider, err.message);
     res.json({ ok: false, error: err.message });
   }
 });
 
-// OAuth callback — sends code to browser which does token exchange
-// (ECS container can't reach portal.int-tools, but user's browser can via Jamf)
+// OAuth callback — exchange code for tokens server-side (Google/Slack APIs are reachable)
 app.get('/api/auth/callback', async (req, res) => {
   const { code, state, error } = req.query;
 
@@ -254,56 +259,61 @@ app.get('/api/auth/callback', async (req, res) => {
   if (!flow) {
     return res.send('<html><body><h2>Invalid or expired state</h2><script>window.close()</script></body></html>');
   }
+  pendingOauthFlows.delete(state);
 
   const provider = flow.provider;
-  const serverConf = MCP_OAUTH_SERVERS[provider];
-  const client = oauthClients.get(provider);
+  const providerConf = DIRECT_OAUTH_PROVIDERS[provider];
 
-  // Send a page that does the token exchange from the browser
-  res.send(`<!DOCTYPE html><html><head><title>Connecting...</title></head><body>
-    <h2>Completing authorization...</h2><p id="status">Exchanging token...</p>
-    <script>
-    (async () => {
-      const status = document.getElementById('status');
-      try {
-        const tokenResp = await fetch('${serverConf.baseUrl}/token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            grant_type: 'authorization_code',
-            code: '${code}',
-            redirect_uri: '${OAUTH_CALLBACK_URL}',
-            client_id: '${client.client_id}',
-            client_secret: '${client.client_secret}',
-            code_verifier: '${flow.codeVerifier}',
-          }),
-        });
-        if (!tokenResp.ok) throw new Error('Token exchange failed: ' + tokenResp.status);
-        const tokens = await tokenResp.json();
+  try {
+    const tokenResp = await fetch(providerConf.tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: OAUTH_CALLBACK_URL,
+        client_id: providerConf.clientId,
+        client_secret: providerConf.clientSecret,
+      }),
+    });
 
-        const saveResp = await fetch('/api/auth/${provider}/save-tokens', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'include',
-          body: JSON.stringify({ access_token: tokens.access_token, refresh_token: tokens.refresh_token, expires_in: tokens.expires_in }),
-        });
-        const saveData = await saveResp.json();
+    if (!tokenResp.ok) {
+      const errBody = await tokenResp.text();
+      throw new Error(`Token exchange failed: ${tokenResp.status} ${errBody}`);
+    }
 
-        if (saveData.ok) {
-          status.textContent = '${serverConf.name} connected!';
-          if (window.opener) window.opener.postMessage({type:'oauth-complete',provider:'${provider}',ok:true},'*');
-        } else {
-          throw new Error(saveData.error || 'Failed to save tokens');
-        }
-      } catch (err) {
-        status.textContent = 'Error: ' + err.message;
-        if (window.opener) window.opener.postMessage({type:'oauth-complete',provider:'${provider}',ok:false},'*');
-      }
-      setTimeout(() => window.close(), 2000);
-    })();
+    const tokens = await tokenResp.json();
+    const accessToken = tokens.access_token || tokens.authed_user?.access_token;
+    const refreshToken = tokens.refresh_token;
+
+    let session = userTokenStore.get(flow.sessionId);
+    if (!session) {
+      for (const [, sess] of userTokenStore) { session = sess; break; }
+    }
+    if (!session) {
+      session = { tokens: {}, createdAt: Date.now() };
+      userTokenStore.set(crypto.randomBytes(24).toString('hex'), session);
+    }
+
+    session.tokens[provider] = {
+      accessToken: encryptToken(accessToken),
+      refreshToken: refreshToken ? encryptToken(refreshToken) : null,
+      expiresAt: tokens.expires_in ? Date.now() + tokens.expires_in * 1000 : null,
+    };
+    saveUserTokens();
+    console.log(`[OAUTH] ${providerConf.name} connected via direct OAuth`);
+
+    res.send(`<html><body><h2>${providerConf.name} connected!</h2><script>
+      if (window.opener) window.opener.postMessage({type:'oauth-complete',provider:'${provider}',ok:true},'*');
+      setTimeout(() => window.close(), 1500);
     </script></body></html>`);
-
-  pendingOauthFlows.delete(state);
+  } catch (err) {
+    console.error('[OAUTH CALLBACK ERROR]', err.message);
+    res.send(`<html><body><h2>Authorization failed</h2><p>${err.message}</p><script>
+      if (window.opener) window.opener.postMessage({type:'oauth-complete',provider:'${provider}',ok:false},'*');
+      setTimeout(() => window.close(), 3000);
+    </script></body></html>`);
+  }
 });
 
 // Save tokens from browser-side token exchange
@@ -1464,38 +1474,111 @@ function detectMcpIntent(prompt) {
   return intents;
 }
 
-async function executeMcpPreFetch(intents, googleToken, slackToken) {
+async function executeDirectPreFetch(intents, googleToken, slackToken) {
   if (intents.length === 0) return [];
   const results = [];
   for (const intent of intents) {
     try {
+      let data = null;
       if (intent.provider === 'google-workspace' && googleToken) {
-        const result = await mcpCallToolWithToken(intent.tool, intent.args, googleToken, MCP_GOOGLE_BASE);
-        if (result?.result?.content) {
-          let text = '';
-          for (const item of result.result.content) {
-            if (item.type === 'text') text += item.text;
-          }
-          if (text) results.push({ tool: intent.tool, data: text });
-        }
+        data = await callGoogleApi(intent.tool, intent.args, googleToken);
       } else if (intent.provider === 'slack' && slackToken) {
-        const sessionId = await getSlackSession(slackToken);
-        if (sessionId) {
-          const result = await slackMcpCallTool(intent.tool, intent.args, slackToken, sessionId);
-          if (result?.result?.content) {
-            let text = '';
-            for (const item of result.result.content) {
-              if (item.type === 'text') text += item.text;
-            }
-            if (text) results.push({ tool: intent.tool, data: text });
-          }
-        }
+        data = await callSlackApi(intent.tool, intent.args, slackToken);
       }
+      if (data) results.push({ tool: intent.tool, data });
     } catch (err) {
-      console.error(`[MCP PRE-FETCH] ${intent.tool} failed:`, err.message);
+      console.error(`[PRE-FETCH] ${intent.tool} failed:`, err.message);
     }
   }
   return results;
+}
+
+async function callGoogleApi(tool, args, accessToken) {
+  const headers = { Authorization: `Bearer ${accessToken}` };
+  let url, resp, data;
+
+  if (tool === 'gmail_search') {
+    url = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(args.query)}&maxResults=${args.max_results || 10}`;
+    resp = await fetch(url, { headers });
+    if (!resp.ok) return null;
+    data = await resp.json();
+    if (!data.messages?.length) return 'No emails found matching the query.';
+    const details = await Promise.all(data.messages.slice(0, 5).map(async (m) => {
+      const msgResp = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date`, { headers });
+      if (!msgResp.ok) return null;
+      const msg = await msgResp.json();
+      const hdrs = {};
+      (msg.payload?.headers || []).forEach(h => { hdrs[h.name] = h.value; });
+      return `- From: ${hdrs.From || '?'} | Subject: ${hdrs.Subject || '(no subject)'} | Date: ${hdrs.Date || '?'} | Snippet: ${msg.snippet || ''}`;
+    }));
+    return `Found ${data.messages.length} emails:\n${details.filter(Boolean).join('\n')}`;
+  }
+
+  if (tool === 'gcal_list_events') {
+    const params = new URLSearchParams({ singleEvents: 'true', orderBy: 'startTime', maxResults: String(args.max_results || 20) });
+    if (args.time_min) params.set('timeMin', args.time_min);
+    if (args.time_max) params.set('timeMax', args.time_max);
+    url = `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`;
+    resp = await fetch(url, { headers });
+    if (!resp.ok) return null;
+    data = await resp.json();
+    if (!data.items?.length) return 'No events found for this time range.';
+    return `Calendar events:\n${data.items.map(e => `- ${e.summary || '(no title)'} | ${e.start?.dateTime || e.start?.date || '?'} - ${e.end?.dateTime || e.end?.date || '?'} | ${e.location || ''}`).join('\n')}`;
+  }
+
+  if (tool === 'gtasks_list') {
+    resp = await fetch('https://tasks.googleapis.com/tasks/v1/users/@me/lists', { headers });
+    if (!resp.ok) return null;
+    data = await resp.json();
+    const allTasks = [];
+    for (const list of (data.items || []).slice(0, 5)) {
+      const tasksResp = await fetch(`https://tasks.googleapis.com/tasks/v1/lists/${list.id}/tasks?maxResults=20&showCompleted=false`, { headers });
+      if (!tasksResp.ok) continue;
+      const tasks = await tasksResp.json();
+      for (const t of (tasks.items || [])) {
+        allTasks.push(`- [${list.title}] ${t.title || '(no title)'}${t.due ? ' (due: ' + t.due.split('T')[0] + ')' : ''}`);
+      }
+    }
+    return allTasks.length ? `Tasks:\n${allTasks.join('\n')}` : 'No open tasks found.';
+  }
+
+  if (tool === 'gdrive_search') {
+    url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`fullText contains '${args.query}'`)}&fields=files(id,name,mimeType,modifiedTime,webViewLink)&pageSize=10`;
+    resp = await fetch(url, { headers });
+    if (!resp.ok) return null;
+    data = await resp.json();
+    if (!data.files?.length) return 'No Drive files found matching the query.';
+    return `Drive files:\n${data.files.map(f => `- ${f.name} (${f.mimeType}) | Modified: ${f.modifiedTime || '?'} | ${f.webViewLink || ''}`).join('\n')}`;
+  }
+
+  return null;
+}
+
+async function callSlackApi(tool, args, accessToken) {
+  const headers = { Authorization: `Bearer ${accessToken}` };
+
+  if (tool === 'slack_search') {
+    const resp = await fetch(`https://slack.com/api/search.messages?query=${encodeURIComponent(args.query)}&count=${args.max_results || 10}`, { headers });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (!data.ok || !data.messages?.matches?.length) return 'No Slack messages found matching the query.';
+    return `Slack messages:\n${data.messages.matches.slice(0, 10).map(m => `- #${m.channel?.name || '?'} | ${m.username || '?'}: ${m.text?.slice(0, 200) || ''} | ${m.ts ? new Date(m.ts * 1000).toISOString() : ''}`).join('\n')}`;
+  }
+
+  if (tool === 'slack_read_channel') {
+    const listResp = await fetch(`https://slack.com/api/conversations.list?types=public_channel,private_channel&limit=200`, { headers });
+    if (!listResp.ok) return null;
+    const listData = await listResp.json();
+    const channel = listData.channels?.find(c => c.name === args.channel);
+    if (!channel) return `Channel #${args.channel} not found.`;
+    const histResp = await fetch(`https://slack.com/api/conversations.history?channel=${channel.id}&limit=${args.max_results || 20}`, { headers });
+    if (!histResp.ok) return null;
+    const histData = await histResp.json();
+    if (!histData.ok || !histData.messages?.length) return `No recent messages in #${args.channel}.`;
+    return `Recent messages in #${args.channel}:\n${histData.messages.map(m => `- ${m.user || '?'}: ${m.text?.slice(0, 200) || ''}`).join('\n')}`;
+  }
+
+  return null;
 }
 
 function parseCookieHeader(cookieStr) {
@@ -1656,7 +1739,7 @@ wss.on('connection', (ws, req) => {
           for (const intent of mcpIntents) {
             ws.send(JSON.stringify({ action: 'chat-status', text: intent.label }));
           }
-          const fetchResults = await executeMcpPreFetch(mcpIntents, googleToken, slackToken);
+          const fetchResults = await executeDirectPreFetch(mcpIntents, googleToken, slackToken);
           console.log(`[PRE-FETCH] Results: ${fetchResults.length} items, tools: ${fetchResults.map(r => r.tool).join(', ')}`);
           if (fetchResults.length > 0) {
             mcpPreFetched = true;

@@ -2050,8 +2050,7 @@ CMT style: white bg, blue (#1a80d7) accents, black body. Allowed backgrounds: #F
 
   showStatus();
 
-  // Browser-side MCP pre-fetch (server can't reach portal, but browser can via Jamf)
-  browserPreFetchAndSend(fullText, attachedFiles, activeConversationId, !!editingPanel);
+  ws.send(JSON.stringify({ action: 'chat', text: fullText, files: attachedFiles, conversationId: activeConversationId, editingPanel: !!editingPanel }));
 
   attachedFiles = [];
   renderFilePreview();

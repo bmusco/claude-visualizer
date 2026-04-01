@@ -23,6 +23,12 @@ if [ -n "$CLAUDE_CONFIG_TAR_B64" ] && [ "$CLAUDE_CONFIG_TAR_B64" != "placeholder
     cp "$HOME/.oauth-clients.json" /app/.oauth-clients.json 2>/dev/null || true
     echo "[entrypoint] OAuth clients restored"
   fi
+
+  # Load OAuth credentials from config if not set via env
+  if [ -f "$HOME/.oauth-env" ]; then
+    source "$HOME/.oauth-env"
+    echo "[entrypoint] OAuth env vars loaded"
+  fi
 fi
 
 exec "$@"

@@ -39,6 +39,22 @@ resource "aws_ecs_task_definition" "service" {
         {
           name      = "CLAUDE_CONFIG_TAR_B64"
           valueFrom = aws_secretsmanager_secret.claude-config.arn
+        },
+        {
+          name      = "GOOGLE_CLIENT_ID"
+          valueFrom = "${aws_secretsmanager_secret.oauth-credentials.arn}:GOOGLE_CLIENT_ID::"
+        },
+        {
+          name      = "GOOGLE_CLIENT_SECRET"
+          valueFrom = "${aws_secretsmanager_secret.oauth-credentials.arn}:GOOGLE_CLIENT_SECRET::"
+        },
+        {
+          name      = "SLACK_CLIENT_ID_OAUTH"
+          valueFrom = "${aws_secretsmanager_secret.oauth-credentials.arn}:SLACK_CLIENT_ID_OAUTH::"
+        },
+        {
+          name      = "SLACK_CLIENT_SECRET_OAUTH"
+          valueFrom = "${aws_secretsmanager_secret.oauth-credentials.arn}:SLACK_CLIENT_SECRET_OAUTH::"
         }
       ]
       logConfiguration = {

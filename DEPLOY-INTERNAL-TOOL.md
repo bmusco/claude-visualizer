@@ -28,7 +28,15 @@ User → CloudFront
 aws s3 mb s3://claudio-int-tools --region us-east-1
 ```
 
-Or via Terraform using the `custom-s3-backed-static-website` module:
+Or via Terraform using the `custom-s3-backed-static-website` module
+(see `deploy/terraform/frontend/terragrunt.hcl` in this repo):
+
+```bash
+# Copy into terraform-dev and open PR:
+cp -r deploy/terraform/frontend \
+  terraform-dev/environments/internal-tools/cloudfront/claudio/
+```
+
 - `bucket-override-name` → `claudio-int-tools`
 - `website-domain` → `claudio.int-tools.cmtelematics.com`
 - `custom-error-responses` → 403/404 → `/index.html` (SPA routing)

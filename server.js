@@ -1023,8 +1023,8 @@ function mcpCallToolWithToken(toolName, args, token, mcpUrl) {
         } catch { resolve(null); }
       });
     });
-    req.on('error', () => resolve(null));
-    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
+    req.on('error', (err) => { console.error(`[MCP CALL] ${toolName} network error:`, err.message); resolve(null); });
+    req.setTimeout(15000, () => { console.error(`[MCP CALL] ${toolName} timeout`); req.destroy(); resolve(null); });
     req.write(body);
     req.end();
   });
@@ -1636,11 +1636,14 @@ wss.on('connection', (ws, req) => {
         const googleToken = googleTokenData?.accessToken ? decryptToken(googleTokenData.accessToken) : null;
         const slackToken = slackTokenData?.accessToken ? decryptToken(slackTokenData.accessToken) : null;
 
+        console.log(`[PRE-FETCH] Intents: ${mcpIntents.map(i => i.tool).join(', ')}, googleToken: ${!!googleToken}, slackToken: ${!!slackToken}`);
+
         if (googleToken || slackToken) {
           for (const intent of mcpIntents) {
             ws.send(JSON.stringify({ action: 'chat-status', text: intent.label }));
           }
           const fetchResults = await executeMcpPreFetch(mcpIntents, googleToken, slackToken);
+          console.log(`[PRE-FETCH] Results: ${fetchResults.length} items, tools: ${fetchResults.map(r => r.tool).join(', ')}`);
           if (fetchResults.length > 0) {
             mcpPreFetched = true;
             const dataBlock = fetchResults.map(r =>
@@ -1648,7 +1651,11 @@ wss.on('connection', (ws, req) => {
             ).join('\n');
             userMessage += dataBlock;
           }
+        } else {
+          console.log('[PRE-FETCH] No tokens available for pre-fetch');
         }
+      } else {
+        if (mcpIntents.length > 0) console.log('[PRE-FETCH] No active session with tokens found');
       }
 
       // Build full prompt with conversation history

@@ -79,6 +79,8 @@ resource "aws_ecs_service" "service" {
     }
   }
 
+  depends_on = [aws_lb_listener_rule.service-rule]
+
   load_balancer {
     target_group_arn = aws_lb_target_group.tg-shared.arn
     container_name   = var.service-name

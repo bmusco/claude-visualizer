@@ -26,6 +26,21 @@ var DEFAULT_THEME = {
 
 var T = {}; // Active theme — set per presentation in buildPresentation()
 
+// Google Slides canvas: 720 x 405 points (10" x 5.625" at 72 DPI)
+// All layout coordinates must fit within this.
+var L = {
+  PW: 720,          // page width
+  PH: 405,          // page height
+  M: 36,            // margin left/right
+  CW: 648,          // content width (720 - 2*36)
+  TY: 22,           // title Y
+  TH: 32,           // title height
+  CY: 64,           // content start Y (below title)
+  FZ: 28,           // footer zone height
+  MAX_Y: 377,       // max content Y (405 - 28)
+  AH: 313,          // available height for content (377 - 64)
+};
+
 function doGet(e) {
   if (e && e.parameter && e.parameter.data) {
     try {
@@ -125,12 +140,21 @@ function buildPresentation(title, slides, deckConfig) {
       case 'split':       buildSplit(slide, slideTitle, slideBody); break;
       // Slot-based layouts
       case 'fact':        buildFact(slide, slideTitle, slideBody); break;
+      case 'quote':       buildQuote(slide, slideTitle, slideBody); break;
+      case 'statement':   buildStatement(slide, slideTitle, slideBody); break;
       case 'twocols':     buildTwoCols(slide, slideTitle, slideBody); break;
       case 'imageleft':   buildImageSide(slide, slideTitle, slideBody, s.image || '', 'left'); break;
       case 'imageright':  buildImageSide(slide, slideTitle, slideBody, s.image || '', 'right'); break;
       // Freeform
       case 'custom':      buildCustom(slide, s.elements || []); break;
-      default:            buildCustom(slide, s.elements || []); break;
+      default:
+        // Default: if there are elements, render custom; otherwise build a title+body slide
+        if (s.elements && s.elements.length > 0) {
+          buildCustom(slide, s.elements);
+        } else if (slideTitle || slideBody) {
+          buildDefaultSlide(slide, slideTitle, slideBody);
+        }
+        break;
     }
 
     // Speaker notes
@@ -196,23 +220,43 @@ function applyTransition(slide, type, duration) {
 // CUSTOM — freeform element placement
 // ═══════════════════════════════════════════════════════════════
 
+function buildDefaultSlide(slide, title, body) {
+  // Simple title + bullet body for slides with no layout and no elements
+  if (title) {
+    var tBox = slide.insertTextBox(title, L.M, L.TY, L.CW, L.TH);
+    styleText(tBox, T.titleSize, T.accentColor, true);
+  }
+  if (body) {
+    var content = body.replace(/^- /gm, '\u2022  ');
+    var bBox = slide.insertTextBox(content, L.M, L.CY, L.CW, L.AH);
+    styleText(bBox, T.bodySize, T.bodyColor, false);
+    bBox.getText().getParagraphStyle().setLineSpacing(150);
+    applyBoldMarkers(bBox.getText());
+  }
+}
+
 function buildCustom(slide, elements) {
   if (!elements || elements.length === 0) return;
 
+  // Scale factor: CLAUDE.md tells Claude to use 960x540 canvas,
+  // but Google Slides native is 720x405. Scale all coordinates.
+  var SX = 720 / 960;  // 0.75
+  var SY = 405 / 540;  // 0.75
+
   for (var i = 0; i < elements.length; i++) {
     var el = elements[i];
-    var x = el.x || 0;
-    var y = el.y || 0;
-    var w = el.w || 200;
-    var h = el.h || 40;
+    var x = (el.x || 0) * SX;
+    var y = (el.y || 0) * SY;
+    var w = (el.w || 200) * SX;
+    var h = (el.h || 40) * SY;
 
     if (el.type === 'text') {
       var content = (el.content || '').replace(/^- /gm, '\u2022  ');
       var tBox = slide.insertTextBox(content, x, y, w, h);
       var style = tBox.getText().getTextStyle();
       style.setFontFamily(T.font);
-      style.setFontSize(el.fontSize || T.bodySize);
-      style.setForegroundColor(el.color || T.bodyColor);
+      style.setFontSize(Math.round((el.fontSize || T.bodySize) * SX));
+      style.setForegroundColor(normalizeHex(el.color || T.bodyColor));
       style.setBold(!!el.bold);
       if (el.italic) style.setItalic(true);
 
@@ -230,7 +274,7 @@ function buildCustom(slide, elements) {
       var shape = slide.insertShape(shapeType, x, y, w, h);
       shape.getBorder().setTransparent();
       if (el.fill) {
-        shape.getFill().setSolidFill(el.fill);
+        shape.getFill().setSolidFill(normalizeHex(el.fill));
       } else {
         shape.getFill().setSolidFill(T.lightBg);
       }
@@ -239,8 +283,8 @@ function buildCustom(slide, elements) {
         sText.setText(el.content);
         var sStyle = sText.getTextStyle();
         sStyle.setFontFamily(T.font);
-        sStyle.setFontSize(el.fontSize || 14);
-        sStyle.setForegroundColor(el.color || T.white);
+        sStyle.setFontSize(Math.round((el.fontSize || 14) * SX));
+        sStyle.setForegroundColor(normalizeHex(el.color || T.white));
         sStyle.setBold(!!el.bold);
         sText.getParagraphStyle().setParagraphAlignment(SlidesApp.ParagraphAlignment.CENTER);
         shape.setContentAlignment(SlidesApp.ContentAlignment.MIDDLE);
@@ -270,24 +314,24 @@ function buildCustom(slide, elements) {
 
 function buildFact(slide, title, body) {
   // Decorative watermark
-  var wmBox = slide.insertTextBox(title, -40, 40, 600, 280);
-  styleText(wmBox, 160, T.accentVeryLight, true);
+  var wmBox = slide.insertTextBox(title, -30, 30, 450, 210);
+  styleText(wmBox, 120, T.accentVeryLight, true);
   wmBox.getText().getParagraphStyle().setParagraphAlignment(SlidesApp.ParagraphAlignment.CENTER);
 
   // Hero number
-  var hBox = slide.insertTextBox(title, 80, 100, 800, 160);
-  styleText(hBox, 84, T.accentColor, true);
+  var hBox = slide.insertTextBox(title, 60, 75, 600, 120);
+  styleText(hBox, 64, T.accentColor, true);
   hBox.getText().getParagraphStyle().setParagraphAlignment(SlidesApp.ParagraphAlignment.CENTER);
 
   // Accent line
-  var line = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 420, 275, 120, 3);
+  var line = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 315, 205, 90, 3);
   line.getBorder().setTransparent();
   line.getFill().setSolidFill(T.accentColor);
 
   // Context
   if (body) {
-    var bBox = slide.insertTextBox(body, 140, 300, 680, 140);
-    styleText(bBox, 20, T.darkAccent, false);
+    var bBox = slide.insertTextBox(body, 105, 225, 510, 120);
+    styleText(bBox, 16, T.darkAccent, false);
     bBox.getText().getParagraphStyle().setParagraphAlignment(SlidesApp.ParagraphAlignment.CENTER);
     bBox.getText().getParagraphStyle().setLineSpacing(150);
   }
@@ -300,29 +344,29 @@ function buildFact(slide, title, body) {
 
 function buildQuote(slide, attribution, body) {
   // Vertical accent bar
-  var bar = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 64, 80, 4, 300);
+  var bar = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 48, 60, 4, 225);
   bar.getBorder().setTransparent();
   bar.getFill().setSolidFill(T.accentColor);
 
   // Decorative open quote
-  var qMark = slide.insertTextBox('\u201c', 88, 55, 80, 100);
-  styleText(qMark, 80, T.accentVeryLight, true);
+  var qMark = slide.insertTextBox('\u201c', 66, 42, 60, 75);
+  styleText(qMark, 60, T.accentVeryLight, true);
 
   // Quote text
-  var qBox = slide.insertTextBox(body, 100, 120, 760, 220);
-  styleText(qBox, 26, T.bodyColor, false);
+  var qBox = slide.insertTextBox(body, 75, 90, 570, 165);
+  styleText(qBox, 20, T.bodyColor, false);
   qBox.getText().getTextStyle().setItalic(true);
   qBox.getText().getParagraphStyle().setLineSpacing(170);
 
   // Separator
-  var sep = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 100, 355, 120, 1);
+  var sep = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 75, 270, 90, 1);
   sep.getBorder().setTransparent();
   sep.getFill().setSolidFill(T.midGray);
 
   // Attribution
   if (attribution) {
-    var aBox = slide.insertTextBox('\u2014  ' + attribution, 100, 370, 760, 40);
-    styleText(aBox, 16, T.subtleColor, false);
+    var aBox = slide.insertTextBox('\u2014  ' + attribution, 75, 280, 570, 30);
+    styleText(aBox, 13, T.subtleColor, false);
   }
 }
 
@@ -333,25 +377,25 @@ function buildQuote(slide, attribution, body) {
 
 function buildStatement(slide, title, body) {
   // Accent line above
-  var line = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 340, 140, 280, 3);
+  var line = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 255, 105, 210, 3);
   line.getBorder().setTransparent();
   line.getFill().setSolidFill(T.accentColor);
 
   // Statement
-  var sBox = slide.insertTextBox(title, 80, 165, 800, 180);
-  styleText(sBox, 32, T.bodyColor, true);
+  var sBox = slide.insertTextBox(title, 60, 120, 600, 135);
+  styleText(sBox, 24, T.bodyColor, true);
   sBox.getText().getParagraphStyle().setParagraphAlignment(SlidesApp.ParagraphAlignment.CENTER);
   sBox.getText().getParagraphStyle().setLineSpacing(150);
 
   // Accent line below
-  var line2 = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 340, 360, 280, 3);
+  var line2 = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 255, 268, 210, 3);
   line2.getBorder().setTransparent();
   line2.getFill().setSolidFill(T.accentColor);
 
   // Optional subtitle
   if (body) {
-    var bBox = slide.insertTextBox(body, 140, 380, 680, 80);
-    styleText(bBox, 18, T.subtleColor, false);
+    var bBox = slide.insertTextBox(body, 105, 280, 510, 60);
+    styleText(bBox, 14, T.subtleColor, false);
     bBox.getText().getParagraphStyle().setParagraphAlignment(SlidesApp.ParagraphAlignment.CENTER);
     bBox.getText().getParagraphStyle().setLineSpacing(140);
   }
@@ -366,49 +410,49 @@ function buildTwoCols(slide, title, body) {
   var titles = title.split('|');
   var leftTitle = (titles[0] || '').trim();
   var rightTitle = (titles[1] || '').trim();
+  var colW = L.CW / 2;       // 324
+  var rightX = L.M + colW + 12;
 
   // Left header
-  var ltBox = slide.insertTextBox(leftTitle, 48, 30, 416, 42);
-  styleText(ltBox, 22, T.accentColor, true);
+  var ltBox = slide.insertTextBox(leftTitle, L.M, L.TY, colW - 6, L.TH);
+  styleText(ltBox, 18, T.accentColor, true);
 
   // Right header
-  var rtBox = slide.insertTextBox(rightTitle, 496, 30, 416, 42);
-  styleText(rtBox, 22, T.accentColor, true);
+  var rtBox = slide.insertTextBox(rightTitle, rightX, L.TY, colW - 6, L.TH);
+  styleText(rtBox, 18, T.accentColor, true);
 
   // Vertical divider
-  var divider = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 478, 30, 2, 440);
+  var divider = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, L.M + colW + 4, L.TY, 2, L.AH);
   divider.getBorder().setTransparent();
   divider.getFill().setSolidFill(T.midGray);
 
   var lines = body.split('\n').filter(function(l) { return l.trim(); });
-  var availH = 390;
-  var startY = 84;
-  var itemH = Math.min(70, availH / lines.length);
+  var itemH = Math.min(52, L.AH / lines.length);
 
   for (var i = 0; i < lines.length; i++) {
     var parts = lines[i].split('|');
-    var y = startY + i * itemH;
+    var y = L.CY + i * itemH;
     var leftText = (parts[0] || '').trim().replace(/^[-•]\s*/, '');
     var rightText = (parts.length > 1 ? parts[1] : '').trim().replace(/^[-•]\s*/, '');
 
-    var fontSize = lines.length > 5 ? 13 : 15;
+    var fontSize = lines.length > 5 ? 11 : 13;
 
     // Left bullet
-    var lDot = slide.insertShape(SlidesApp.ShapeType.ELLIPSE, 48, y + 8, 6, 6);
+    var lDot = slide.insertShape(SlidesApp.ShapeType.ELLIPSE, L.M, y + 6, 5, 5);
     lDot.getBorder().setTransparent();
     lDot.getFill().setSolidFill(T.accentColor);
-    var lBox = slide.insertTextBox(leftText, 64, y, 400, itemH);
+    var lBox = slide.insertTextBox(leftText, L.M + 12, y, colW - 18, itemH);
     styleText(lBox, fontSize, T.bodyColor, false);
-    lBox.getText().getParagraphStyle().setLineSpacing(fontSize <= 13 ? 120 : 135);
+    lBox.getText().getParagraphStyle().setLineSpacing(fontSize <= 11 ? 115 : 130);
 
     // Right bullet
     if (rightText) {
-      var rDot = slide.insertShape(SlidesApp.ShapeType.ELLIPSE, 496, y + 8, 6, 6);
+      var rDot = slide.insertShape(SlidesApp.ShapeType.ELLIPSE, rightX, y + 6, 5, 5);
       rDot.getBorder().setTransparent();
       rDot.getFill().setSolidFill(T.accentColor);
-      var rBox = slide.insertTextBox(rightText, 512, y, 400, itemH);
+      var rBox = slide.insertTextBox(rightText, rightX + 12, y, colW - 18, itemH);
       styleText(rBox, fontSize, T.bodyColor, false);
-      rBox.getText().getParagraphStyle().setLineSpacing(fontSize <= 13 ? 120 : 135);
+      rBox.getText().getParagraphStyle().setLineSpacing(fontSize <= 11 ? 115 : 130);
     }
   }
 }
@@ -421,38 +465,36 @@ function buildTwoCols(slide, title, body) {
 function buildImageSide(slide, title, body, imageDesc, side) {
   var imgX, imgY, imgW, imgH, textX, textW;
   if (side === 'left') {
-    imgX = 40; imgY = 30; imgW = 400; imgH = 440;
-    textX = 472; textW = 440;
+    imgX = L.M; imgY = L.TY; imgW = 300; imgH = L.AH;
+    textX = L.M + 312; textW = L.CW - 312;
   } else {
-    imgX = 520; imgY = 30; imgW = 400; imgH = 440;
-    textX = 48; textW = 440;
+    imgX = L.PW - L.M - 300; imgY = L.TY; imgW = 300; imgH = L.AH;
+    textX = L.M; textW = L.CW - 312;
   }
 
   // Image placeholder
   buildImagePlaceholder(slide, imgX, imgY, imgW, imgH, imageDesc);
 
   // Title
-  var tBox = slide.insertTextBox(title, textX, 30, textW, 50);
+  var tBox = slide.insertTextBox(title, textX, L.TY, textW, L.TH);
   styleText(tBox, T.titleSize, T.accentColor, true);
 
   // Body content
   var lines = body.split('\n').filter(function(l) { return l.trim(); });
-  var startY = 96;
-  var availH = 370;
-  var itemH = Math.min(65, availH / lines.length);
-  var fontSize = lines.length > 5 ? 13 : 15;
+  var itemH = Math.min(48, L.AH / lines.length);
+  var fontSize = lines.length > 5 ? 11 : 13;
 
   for (var i = 0; i < lines.length; i++) {
     var text = lines[i].trim().replace(/^[-•]\s*/, '');
-    var y = startY + i * itemH;
+    var y = L.CY + i * itemH;
 
-    var accent = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, textX, y + 4, 3, itemH - 12);
+    var accent = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, textX, y + 3, 3, itemH - 8);
     accent.getBorder().setTransparent();
     accent.getFill().setSolidFill(T.accentColor);
 
-    var iBox = slide.insertTextBox(text, textX + 14, y + 4, textW - 14, itemH - 8);
+    var iBox = slide.insertTextBox(text, textX + 12, y + 3, textW - 12, itemH - 6);
     styleText(iBox, fontSize, T.bodyColor, false);
-    iBox.getText().getParagraphStyle().setLineSpacing(fontSize <= 13 ? 120 : 140);
+    iBox.getText().getParagraphStyle().setLineSpacing(fontSize <= 11 ? 115 : 135);
     applyBoldMarkers(iBox.getText());
   }
 }
@@ -462,15 +504,14 @@ function buildImageSide(slide, title, body, imageDesc, side) {
 // ═══════════════════════════════════════════════════════════════
 
 function buildMetrics(slide, title, body) {
-  var tBox = slide.insertTextBox(title, 48, 30, 860, 42);
+  var tBox = slide.insertTextBox(title, L.M, L.TY, L.CW, L.TH);
   styleText(tBox, T.titleSize, T.accentColor, true);
 
   var items = body.split('\n').filter(function(l) { return l.trim(); });
   var cols = items.length <= 3 ? items.length : (items.length <= 4 ? 2 : 3);
   var rows = Math.ceil(items.length / cols);
-  var cellW = 860 / cols;
-  var availH = 450;
-  var cellH = Math.min(200, availH / rows);
+  var cellW = L.CW / cols;
+  var cellH = Math.min(150, L.AH / rows);
 
   for (var i = 0; i < items.length; i++) {
     var parts = items[i].split('|');
@@ -478,22 +519,22 @@ function buildMetrics(slide, title, body) {
     var label = parts.length > 1 ? parts[1].trim() : '';
     var col = i % cols;
     var row = Math.floor(i / cols);
-    var x = 48 + col * cellW;
-    var y = 84 + row * cellH;
+    var x = L.M + col * cellW;
+    var y = L.CY + row * cellH;
 
-    var metricFontSize = cols <= 2 ? 48 : 40;
-    var metricH = cols <= 2 ? 64 : 56;
-    var mBox = slide.insertTextBox(metric, x, y, cellW - 16, metricH);
+    var metricFontSize = cols <= 2 ? 36 : 30;
+    var metricH = cols <= 2 ? 48 : 42;
+    var mBox = slide.insertTextBox(metric, x, y, cellW - 12, metricH);
     styleText(mBox, metricFontSize, T.accentColor, true);
 
-    var accentLine = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, x + 4, y + metricH + 2, Math.min(60, cellW / 3), 2);
+    var accentLine = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, x + 4, y + metricH + 2, Math.min(45, cellW / 3), 2);
     accentLine.getBorder().setTransparent();
     accentLine.getFill().setSolidFill(T.midGray);
 
     if (label) {
-      var labelH = cellH - metricH - 16;
-      var labelFont = autoFitFontSize(label, cellW - 16, labelH, T.bodySize, 10);
-      var lBox = slide.insertTextBox(label, x, y + metricH + 10, cellW - 16, labelH);
+      var labelH = cellH - metricH - 12;
+      var labelFont = autoFitFontSize(label, cellW - 12, labelH, 14, 9);
+      var lBox = slide.insertTextBox(label, x, y + metricH + 8, cellW - 12, labelH);
       styleText(lBox, labelFont, T.bodyColor, false);
       lBox.getText().getParagraphStyle().setLineSpacing(labelFont <= 11 ? 115 : 130);
     }
@@ -508,22 +549,23 @@ function buildComparison(slide, title, body) {
   var titles = title.split('|');
   var leftTitle = titles[0].trim();
   var rightTitle = titles.length > 1 ? titles[1].trim() : '';
+  var colW = L.CW / 2;  // 324
+  var rightX = L.M + colW + 6;
 
-  var lBar = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 48, 30, 416, 42);
+  var lBar = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, L.M, L.TY, colW - 3, L.TH);
   lBar.getBorder().setTransparent();
   lBar.getFill().setSolidFill(T.lightBg);
-  var ltBox = slide.insertTextBox(leftTitle, 60, 34, 392, 34);
-  styleText(ltBox, 20, T.bodyColor, true);
+  var ltBox = slide.insertTextBox(leftTitle, L.M + 8, L.TY + 3, colW - 19, L.TH - 6);
+  styleText(ltBox, 16, T.bodyColor, true);
 
-  var rBar = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 496, 30, 416, 42);
+  var rBar = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, rightX, L.TY, colW - 3, L.TH);
   rBar.getBorder().setTransparent();
   rBar.getFill().setSolidFill(T.accentColor);
-  var rtBox = slide.insertTextBox(rightTitle, 508, 34, 392, 34);
-  styleText(rtBox, 20, T.white, true);
+  var rtBox = slide.insertTextBox(rightTitle, rightX + 8, L.TY + 3, colW - 19, L.TH - 6);
+  styleText(rtBox, 16, T.white, true);
 
   var lines = body.split('\n').filter(function(l) { return l.trim(); });
-  var availH = 440;
-  var rowH = Math.min(80, availH / lines.length);
+  var rowH = Math.min(56, L.AH / lines.length);
 
   var maxCellLen = 0;
   for (var j = 0; j < lines.length; j++) {
@@ -532,29 +574,29 @@ function buildComparison(slide, title, body) {
       maxCellLen = Math.max(maxCellLen, pp[k].trim().length);
     }
   }
-  var baseFontSize = 15;
-  if (maxCellLen > 60 || lines.length > 5) baseFontSize = 13;
-  if (maxCellLen > 80 || lines.length > 7) baseFontSize = 11;
-  var cellFontSize = Math.max(10, Math.min(baseFontSize, Math.floor(rowH / 2.5)));
+  var baseFontSize = 13;
+  if (maxCellLen > 60 || lines.length > 5) baseFontSize = 11;
+  if (maxCellLen > 80 || lines.length > 7) baseFontSize = 10;
+  var cellFontSize = Math.max(9, Math.min(baseFontSize, Math.floor(rowH / 2.5)));
 
   for (var i = 0; i < lines.length; i++) {
     var parts = lines[i].split('|');
-    var y = 84 + i * rowH;
+    var y = L.CY + i * rowH;
 
     if (i > 0) {
-      var sep = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 48, y - 2, 864, 1);
+      var sep = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, L.M, y - 2, L.CW, 1);
       sep.getBorder().setTransparent();
       sep.getFill().setSolidFill(T.lightBg);
     }
 
-    var lBox = slide.insertTextBox(parts[0].trim(), 48, y + 4, 416, rowH - 8);
+    var lBox = slide.insertTextBox(parts[0].trim(), L.M, y + 3, colW - 3, rowH - 6);
     styleText(lBox, cellFontSize, T.subtleColor, false);
-    lBox.getText().getParagraphStyle().setLineSpacing(cellFontSize <= 12 ? 120 : 130);
+    lBox.getText().getParagraphStyle().setLineSpacing(cellFontSize <= 11 ? 115 : 125);
 
     if (parts.length > 1) {
-      var rBox = slide.insertTextBox(parts[1].trim(), 496, y + 4, 416, rowH - 8);
+      var rBox = slide.insertTextBox(parts[1].trim(), rightX, y + 3, colW - 3, rowH - 6);
       styleText(rBox, cellFontSize, T.bodyColor, false);
-      rBox.getText().getParagraphStyle().setLineSpacing(cellFontSize <= 12 ? 120 : 130);
+      rBox.getText().getParagraphStyle().setLineSpacing(cellFontSize <= 11 ? 115 : 125);
     }
   }
 }
@@ -568,20 +610,20 @@ function buildTable(slide, title, body) {
   var lines = body.split('\n').filter(function(l) { return l.trim(); });
   var cols = headers.length;
   var rows = lines.length;
-  var tableW = 864;
+  var tableW = L.CW;
   var colW = tableW / cols;
-  var headerH = 40;
-  var rowH = Math.min(56, 410 / rows);
-  var startX = 48;
-  var startY = 48;
+  var headerH = 30;
+  var rowH = Math.min(42, (L.AH - headerH) / rows);
+  var startX = L.M;
+  var startY = L.TY + 8;
 
   var hBg = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, startX, startY, tableW, headerH);
   hBg.getBorder().setTransparent();
   hBg.getFill().setSolidFill(T.accentColor);
 
   for (var c = 0; c < cols; c++) {
-    var hBox = slide.insertTextBox(headers[c].trim(), startX + c * colW + 8, startY + 6, colW - 16, headerH - 12);
-    styleText(hBox, 14, T.white, true);
+    var hBox = slide.insertTextBox(headers[c].trim(), startX + c * colW + 6, startY + 5, colW - 12, headerH - 10);
+    styleText(hBox, 12, T.white, true);
   }
 
   for (var r = 0; r < rows; r++) {
@@ -600,8 +642,8 @@ function buildTable(slide, title, body) {
 
     for (var c = 0; c < cols; c++) {
       var cellText = (parts[c] || '').trim();
-      var cBox = slide.insertTextBox(cellText, startX + c * colW + 8, y + 6, colW - 16, rowH - 12);
-      styleText(cBox, 14, T.bodyColor, false);
+      var cBox = slide.insertTextBox(cellText, startX + c * colW + 6, y + 4, colW - 12, rowH - 8);
+      styleText(cBox, 11, T.bodyColor, false);
     }
   }
 }
@@ -612,24 +654,24 @@ function buildTable(slide, title, body) {
 
 function buildSectionBlue(slide, title, body) {
   var gradientColors = [T.accentDark, T.accentMid, T.accentColor, T.accentLight];
-  var stripW = 240;
+  var stripW = L.PW / 4;
   for (var g = 0; g < gradientColors.length; g++) {
-    var strip = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, g * stripW, 0, stripW + 1, 540);
+    var strip = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, g * stripW, 0, stripW + 1, L.PH);
     strip.getBorder().setTransparent();
     strip.getFill().setSolidFill(gradientColors[g]);
   }
 
-  var tBox = slide.insertTextBox(title, 64, 130, 830, 100);
-  styleText(tBox, 38, T.white, true);
+  var tBox = slide.insertTextBox(title, 48, 100, 624, 75);
+  styleText(tBox, 30, T.white, true);
   tBox.getText().getParagraphStyle().setLineSpacing(130);
 
-  var line = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 64, 240, 60, 3);
+  var line = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 48, 182, 45, 3);
   line.getBorder().setTransparent();
   line.getFill().setSolidFill(T.white);
 
   if (body) {
-    var bBox = slide.insertTextBox(body, 64, 260, 830, 160);
-    styleText(bBox, 20, T.white, false);
+    var bBox = slide.insertTextBox(body, 48, 195, 624, 120);
+    styleText(bBox, 16, T.white, false);
     bBox.getText().getTextStyle().setForegroundColor(T.accentVeryLight);
     bBox.getText().getParagraphStyle().setLineSpacing(150);
   }
@@ -643,53 +685,55 @@ function buildSplit(slide, title, body) {
   var titles = title.split('|');
   var leftTitle = (titles[0] || '').trim();
   var rightTitle = (titles[1] || '').trim();
+  var leftW = 285;
+  var rightX = leftW + 24;
 
   var panelColors = [T.accentDark, T.accentMid, T.accentColor];
-  var panelStripH = 180;
+  var panelStripH = L.PH / 3;
   for (var g = 0; g < panelColors.length; g++) {
-    var strip = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 0, g * panelStripH, 380, panelStripH + 1);
+    var strip = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 0, g * panelStripH, leftW, panelStripH + 1);
     strip.getBorder().setTransparent();
     strip.getFill().setSolidFill(panelColors[g]);
   }
 
-  var hBox = slide.insertTextBox(leftTitle, 40, 160, 300, 200);
-  styleText(hBox, 26, T.white, true);
+  var hBox = slide.insertTextBox(leftTitle, 30, 120, 225, 150);
+  styleText(hBox, 20, T.white, true);
   hBox.getText().getParagraphStyle().setParagraphAlignment(SlidesApp.ParagraphAlignment.CENTER);
   hBox.getText().getParagraphStyle().setLineSpacing(130);
 
-  var divider = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 170, 370, 40, 3);
+  var divider = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 128, 278, 30, 3);
   divider.getBorder().setTransparent();
   divider.getFill().setSolidFill(T.white);
 
   if (rightTitle) {
-    var rtBox = slide.insertTextBox(rightTitle, 412, 38, 500, 36);
-    styleText(rtBox, 20, T.accentColor, true);
+    var rtBox = slide.insertTextBox(rightTitle, rightX, L.TY, L.PW - rightX - L.M, L.TH);
+    styleText(rtBox, 16, T.accentColor, true);
   }
 
   var lines = body.split('\n').filter(function(l) { return l.trim(); });
-  var availH = rightTitle ? 380 : 420;
-  var startY = rightTitle ? 90 : 60;
-  var itemH = Math.min(56, availH / lines.length);
+  var startY = rightTitle ? L.CY : L.TY + 10;
+  var availH = L.MAX_Y - startY;
+  var itemH = Math.min(42, availH / lines.length);
 
   var maxItemLen = 0;
   for (var j = 0; j < lines.length; j++) {
     maxItemLen = Math.max(maxItemLen, lines[j].trim().length);
   }
-  var itemFont = 15;
-  if (maxItemLen > 60 || lines.length > 5) itemFont = 13;
-  if (maxItemLen > 80 || lines.length > 7) itemFont = 11;
+  var itemFont = 13;
+  if (maxItemLen > 60 || lines.length > 5) itemFont = 11;
+  if (maxItemLen > 80 || lines.length > 7) itemFont = 10;
 
   for (var i = 0; i < lines.length; i++) {
     var text = lines[i].trim().replace(/^[-•]\s*/, '');
     var y = startY + i * itemH;
 
-    var accent = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, 412, y + 4, 3, itemH - 12);
+    var accent = slide.insertShape(SlidesApp.ShapeType.RECTANGLE, rightX, y + 3, 3, itemH - 8);
     accent.getBorder().setTransparent();
     accent.getFill().setSolidFill(T.accentColor);
 
-    var iBox = slide.insertTextBox(text, 424, y + 4, 480, itemH - 8);
+    var iBox = slide.insertTextBox(text, rightX + 12, y + 3, L.PW - rightX - L.M - 12, itemH - 6);
     styleText(iBox, itemFont, T.bodyColor, false);
-    iBox.getText().getParagraphStyle().setLineSpacing(itemFont <= 12 ? 120 : 140);
+    iBox.getText().getParagraphStyle().setLineSpacing(itemFont <= 11 ? 115 : 135);
   }
 }
 
@@ -697,10 +741,21 @@ function buildSplit(slide, title, body) {
 // HELPERS
 // ═══════════════════════════════════════════════════════════════
 
+// Normalize shorthand hex (#fff → #ffffff, #abc → #aabbcc)
+function normalizeHex(color) {
+  if (!color || typeof color !== 'string') return color;
+  color = color.trim();
+  if (/^#[0-9a-fA-F]{3}$/.test(color)) {
+    var r = color[1], g = color[2], b = color[3];
+    return '#' + r + r + g + g + b + b;
+  }
+  return color;
+}
+
 function styleText(textBox, fontSize, color, bold) {
   var style = textBox.getText().getTextStyle();
   style.setFontSize(fontSize);
-  style.setForegroundColor(color);
+  style.setForegroundColor(normalizeHex(color));
   style.setBold(bold);
   style.setFontFamily(T.font);
 }

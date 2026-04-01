@@ -27,6 +27,7 @@ function connect() {
     const data = JSON.parse(e.data);
     if (data.action === 'init') {
       panels = data.panels;
+      loadLayout();
       renderAll();
     } else if (data.action === 'add') {
       // Dedup: skip if panel with same id already exists (e.g. from undo)
@@ -338,6 +339,32 @@ const MIN_W = 300;
 const MIN_H = 180;
 let panelLayout = {}; // id -> { w, h }  (x,y computed by flow)
 
+function saveLayout() {
+  try {
+    // Save w/h per panel (x/y are recomputed by flowLayout)
+    const data = {};
+    for (const [id, lay] of Object.entries(panelLayout)) {
+      data[id] = { w: lay.w, h: lay.h };
+    }
+    localStorage.setItem('claudio-panel-layout', JSON.stringify(data));
+    localStorage.setItem('claudio-layout-mode', currentLayout || 'auto');
+  } catch {}
+}
+
+function loadLayout() {
+  try {
+    const saved = localStorage.getItem('claudio-panel-layout');
+    if (saved) {
+      const data = JSON.parse(saved);
+      for (const [id, lay] of Object.entries(data)) {
+        panelLayout[id] = { ...lay, x: 0, y: 0 };
+      }
+    }
+    const mode = localStorage.getItem('claudio-layout-mode');
+    if (mode) currentLayout = mode;
+  } catch {}
+}
+
 function getContainerWidth() {
   const container = document.getElementById('panels');
   // Account for padding (24px each side)
@@ -356,6 +383,8 @@ function flowLayout(skipId) {
     if (!lay) return;
     if (panel.id == skipId) return;
 
+    const el = container.querySelector(`[data-id="${panel.id}"]`);
+
     // Clamp width to container
     if (lay.w > cw) lay.w = cw;
 
@@ -371,7 +400,6 @@ function flowLayout(skipId) {
     rowH = Math.max(rowH, lay.h);
     x += lay.w + GAP;
 
-    const el = container.querySelector(`[data-id="${panel.id}"]`);
     if (el) {
       el.style.left = lay.x + 'px';
       el.style.top = lay.y + 'px';
@@ -392,6 +420,9 @@ function flowLayout(skipId) {
     container.appendChild(spacer);
   }
   spacer.style.height = totalH + 'px';
+
+  // Persist layout
+  saveLayout();
 }
 
 // Find insert index based on a drop point (center of dragged panel)
@@ -414,6 +445,284 @@ function findInsertIndex(cx, cy, skipId) {
   });
 
   return best;
+}
+
+// ── Auto-arrange: layout modes, sorting, smart sizing ─────────────
+let currentLayout = 'auto';
+
+function getSmartHeight(panel, el) {
+  // Estimate ideal height based on content type and amount
+  if (panel.type === 'slides') return 520;
+  if (panel.type === 'embed') return 450;
+  if (panel.type === 'document') return 480;
+  if (panel.type === 'markdown' && el) {
+    // Check if content has a table — give more height
+    if (el.querySelector('.panel-body table')) return 500;
+    // Estimate from text content length
+    const text = el.querySelector('.panel-body')?.textContent || '';
+    if (text.length < 200) return 300;
+    if (text.length < 500) return 380;
+    return 450;
+  }
+  if (panel.type && panel.type.startsWith('chart-')) return 400;
+  return 400;
+}
+
+function getResponsiveCols(cw) {
+  if (cw < 600) return 1;
+  if (cw < 1200) return 2;
+  return 3;
+}
+
+// Semantic type: groups related panel types together
+// e.g. slides preview + Google Slides embed = "Presentations"
+function getSemanticType(panel) {
+  const mime = (panel.mimeType || '').toLowerCase();
+  const url = panel.url || '';
+  // Presentations: slides panels OR embed panels with presentation mime/url
+  if (panel.type === 'slides') return 'Presentations';
+  if (panel.type === 'embed' && (mime.includes('presentation') || url.includes('/presentation/'))) return 'Presentations';
+  // Spreadsheets: embed panels with spreadsheet mime/url
+  if (panel.type === 'embed' && (mime.includes('spreadsheet') || url.includes('/spreadsheets/'))) return 'Spreadsheets';
+  // Documents: document panels OR embed panels with document mime/url
+  if (panel.type === 'document') return 'Documents';
+  if (panel.type === 'embed' && (mime.includes('document') || url.includes('/document/'))) return 'Documents';
+  // Notes & Tables: markdown panels
+  if (panel.type === 'markdown') return 'Notes & Tables';
+  // Charts
+  if (panel.type && panel.type.startsWith('chart-')) return 'Charts';
+  // Remaining embeds
+  if (panel.type === 'embed') return 'Embeds';
+  return 'Other';
+}
+
+const semanticOrder = { 'Presentations': 0, 'Documents': 1, 'Spreadsheets': 2, 'Notes & Tables': 3, 'Charts': 4, 'Embeds': 5, 'Other': 6 };
+
+function arrangeSort(mode) {
+  _layoutTransitionUntil = Date.now() + 400;
+  const sorted = [...panels];
+  if (mode === 'type') {
+    sorted.sort((a, b) => (semanticOrder[getSemanticType(a)] ?? 99) - (semanticOrder[getSemanticType(b)] ?? 99));
+  } else if (mode === 'newest') {
+    sorted.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0));
+  } else if (mode === 'oldest') {
+    sorted.sort((a, b) => new Date(a.timestamp || 0) - new Date(b.timestamp || 0));
+  } else if (mode === 'name') {
+    sorted.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
+  }
+  panels.length = 0;
+  sorted.forEach(p => panels.push(p));
+
+  // Persist order
+  fetch(`${API_BASE}/api/panels/reorder`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ order: panels.map(p => p.id) })
+  }).catch(() => {});
+
+  closeArrangeMenu();
+  autoArrange(currentLayout);
+}
+
+function autoArrange(mode) {
+  if (mode) currentLayout = mode;
+  closeArrangeMenu();
+
+  // Highlight active layout option
+  document.querySelectorAll('.arrange-opt').forEach(b => {
+    b.classList.toggle('active', b.dataset.layout === currentLayout);
+  });
+
+  const container = document.getElementById('panels');
+  const cw = container.clientWidth - 48;
+
+  // Determine column count
+  let numCols;
+  if (currentLayout === 'auto') numCols = getResponsiveCols(cw);
+  else if (currentLayout === '1-col') numCols = 1;
+  else if (currentLayout === '2-col') numCols = 2;
+  else if (currentLayout === '3-col') numCols = 3;
+  else if (currentLayout === 'masonry') numCols = getResponsiveCols(cw);
+  else numCols = 2;
+
+  const colW = Math.max(Math.floor((cw - GAP * (numCols - 1)) / numCols), 280);
+  const isMasonry = currentLayout === 'masonry';
+
+  // Remove old group dividers
+  container.querySelectorAll('.panel-group-divider').forEach(d => d.remove());
+
+  // Check if sorted by type (show group headers)
+  let lastGroup = null;
+  const isSortedByType = panels.length > 1 && panels.every((p, i) => {
+    if (i === 0) return true;
+    return (semanticOrder[getSemanticType(panels[i - 1])] ?? 99) <= (semanticOrder[getSemanticType(p)] ?? 99);
+  });
+
+  panels.forEach(panel => {
+    const lay = panelLayout[panel.id];
+    if (!lay) return;
+    const el = container.querySelector(`[data-id="${panel.id}"]`);
+
+    lay.w = colW;
+    if (isMasonry) {
+      lay.h = getSmartHeight(panel, el);
+    } else {
+      lay.h = 450;
+    }
+  });
+
+  // Animate the transition
+  container.querySelectorAll('.panel').forEach(el => {
+    el.style.transition = 'left 0.3s ease, top 0.3s ease, width 0.3s ease, height 0.3s ease';
+  });
+
+  if (isMasonry) {
+    // Masonry: pack into columns by shortest column
+    const colTops = new Array(numCols).fill(0);
+
+    panels.forEach(panel => {
+      const lay = panelLayout[panel.id];
+      if (!lay) return;
+
+      // Find shortest column
+      let minCol = 0;
+      for (let c = 1; c < numCols; c++) {
+        if (colTops[c] < colTops[minCol]) minCol = c;
+      }
+
+      lay.x = minCol * (colW + GAP);
+      lay.y = colTops[minCol];
+      colTops[minCol] += lay.h + GAP;
+
+      const el = container.querySelector(`[data-id="${panel.id}"]`);
+      if (el) {
+        el.style.left = lay.x + 'px';
+        el.style.top = lay.y + 'px';
+        el.style.width = lay.w + 'px';
+        el.style.height = lay.h + 'px';
+      }
+    });
+
+    // Update spacer
+    const totalH = Math.max(...colTops) + GAP;
+    let spacer = container.querySelector('.layout-spacer');
+    if (!spacer) {
+      spacer = document.createElement('div');
+      spacer.className = 'layout-spacer';
+      container.appendChild(spacer);
+    }
+    spacer.style.height = totalH + 'px';
+
+    // Rescale slides
+    container.querySelectorAll('.slides-body').forEach(b => scaleSlideFrame(b));
+    saveLayout();
+  } else {
+    // Grid: use flowLayout (handles group dividers too)
+    flowLayout();
+  }
+
+  // Add group dividers if sorted by type
+  if (isSortedByType && panels.length > 1) {
+    let prevGroup = null;
+    panels.forEach(panel => {
+      const group = getSemanticType(panel);
+      if (group !== prevGroup) {
+        prevGroup = group;
+        const lay = panelLayout[panel.id];
+        if (lay && lay.x === 0 && group !== getSemanticType(panels[0])) {
+          const divider = document.createElement('div');
+          divider.className = 'panel-group-divider';
+          divider.textContent = group;
+          divider.style.top = (lay.y - 20) + 'px';
+          divider.style.left = '0px';
+          container.appendChild(divider);
+
+          // Shift this row and everything after it down
+          let shift = false;
+          panels.forEach(p => {
+            const pLay = panelLayout[p.id];
+            if (!pLay) return;
+            if (p.id === panel.id) shift = true;
+            if (shift) {
+              pLay.y += 24;
+              const pEl = container.querySelector(`[data-id="${p.id}"]`);
+              if (pEl) pEl.style.top = pLay.y + 'px';
+            }
+          });
+          divider.style.top = (lay.y - 24) + 'px';
+        }
+      }
+    });
+  }
+
+  // After animation completes, rescale content
+  setTimeout(() => {
+    container.querySelectorAll('.panel').forEach(el => {
+      el.style.transition = '';
+    });
+    container.querySelectorAll('.slides-body').forEach(b => scaleSlideFrame(b));
+    if (!isMasonry) flowLayout();
+  }, 350);
+}
+
+// Arrange menu open/close
+function closeArrangeMenu() {
+  const dd = document.getElementById('arrange-dropdown');
+  if (dd) dd.classList.remove('open');
+}
+
+// ── Window resize: auto-rearrange if in auto mode ─────────────────
+let resizeTimer;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    if (currentLayout === 'auto' && panels.length > 0) autoArrange('auto');
+  }, 300);
+});
+
+// ── Drop indicator for drag reorder ───────────────────────────────
+let dropIndicator = null;
+function getDropIndicator() {
+  if (!dropIndicator) {
+    dropIndicator = document.createElement('div');
+    dropIndicator.className = 'drop-indicator';
+    document.getElementById('panels').appendChild(dropIndicator);
+  }
+  return dropIndicator;
+}
+
+function showDropIndicator(insertIdx, skipId) {
+  const ind = getDropIndicator();
+  // Find the position where the indicator should appear
+  const visiblePanels = panels.filter(p => p.id != skipId);
+  let targetLay;
+  if (insertIdx <= 0) {
+    targetLay = visiblePanels[0] ? panelLayout[visiblePanels[0].id] : null;
+  } else if (insertIdx >= visiblePanels.length) {
+    const last = visiblePanels[visiblePanels.length - 1];
+    targetLay = last ? panelLayout[last.id] : null;
+  } else {
+    targetLay = panelLayout[visiblePanels[insertIdx]?.id];
+  }
+
+  if (!targetLay) { ind.style.display = 'none'; return; }
+
+  if (insertIdx >= visiblePanels.length) {
+    // After last panel
+    ind.style.left = (targetLay.x + targetLay.w + 4) + 'px';
+    ind.style.top = targetLay.y + 'px';
+    ind.style.height = targetLay.h + 'px';
+  } else {
+    // Before target panel
+    ind.style.left = (targetLay.x - 6) + 'px';
+    ind.style.top = targetLay.y + 'px';
+    ind.style.height = targetLay.h + 'px';
+  }
+  ind.style.display = 'block';
+}
+
+function hideDropIndicator() {
+  if (dropIndicator) dropIndicator.style.display = 'none';
 }
 
 // ── Render ─────────────────────────────────────────────────────────
@@ -526,19 +835,24 @@ function _doRenderAll() {
 
 function createPanelElement(panel, index) {
   const el = document.createElement('div');
-  el.className = 'panel';
+  el.className = 'panel no-transition'; // skip transition on first placement
   el.dataset.id = panel.id;
 
   const lay = panelLayout[panel.id];
   el.style.width = lay.w + 'px';
   el.style.height = lay.h + 'px';
   if (minimizedPanels.has(String(panel.id))) el.classList.add('minimized');
+  // Enable transitions after first layout
+  requestAnimationFrame(() => requestAnimationFrame(() => el.classList.remove('no-transition')));
 
   const time = new Date(panel.timestamp).toLocaleTimeString();
   const typeIcon = getPanelTypeIcon(panel.type);
 
   el.innerHTML = `
     <div class="panel-header">
+      <div class="drag-handle" title="Drag to reorder">
+        <svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor" opacity="0.35"><circle cx="3" cy="2" r="1.2"/><circle cx="7" cy="2" r="1.2"/><circle cx="3" cy="6" r="1.2"/><circle cx="7" cy="6" r="1.2"/><circle cx="3" cy="10" r="1.2"/><circle cx="7" cy="10" r="1.2"/><circle cx="3" cy="14" r="1.2"/><circle cx="7" cy="14" r="1.2"/></svg>
+      </div>
       <div class="panel-header-info">
         <span class="panel-type-icon">${typeIcon}</span>
         <span class="panel-title">${escapeHtml(panel.title || panel.type)}</span>
@@ -548,7 +862,20 @@ function createPanelElement(panel, index) {
         <button class="panel-btn edit-btn" data-action="edit" data-panel-id="${panel.id}" title="Edit with chat">Edit</button>
         ${panel.type === 'embed' && panel.url && panel.url.includes('docs.google.com') ? `<a class="panel-btn" href="${escapeHtml(panel.url)}" target="_blank" title="Open in Google Docs">&#x2197;</a>` : ''}
         ${panel.type === 'slides' ? `<button class="panel-btn export-btn" data-action="export" data-export-type="slides" data-panel-id="${panel.id}" title="Export to Google Slides">Export to Slides</button>` : ''}
-        ${panel.type === 'document' ? `<button class="panel-btn export-btn" data-action="export" data-export-type="doc" data-panel-id="${panel.id}" title="Export to Google Docs">Export to Docs</button>` : ''}
+        ${panel.type === 'document' || panel.type === 'markdown' ? `
+          <div class="export-menu-wrapper">
+            <button class="panel-btn export-menu-toggle" data-panel-id="${panel.id}">Export &#9662;</button>
+            <div class="export-menu-dropdown">
+              <button class="export-btn" data-action="export" data-export-type="doc" data-panel-id="${panel.id}">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="#4285F4" stroke-width="1.3"><rect x="3" y="1" width="10" height="14" rx="1.5"/><line x1="5.5" y1="5" x2="10.5" y2="5"/><line x1="5.5" y1="7.5" x2="10.5" y2="7.5"/><line x1="5.5" y1="10" x2="8.5" y2="10"/></svg>
+                Google Doc
+              </button>
+              <button class="export-btn export-sheets-opt" data-action="export" data-export-type="sheets" data-panel-id="${panel.id}">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="#0F9D58" stroke-width="1.3"><rect x="2" y="2" width="12" height="12" rx="1.5"/><line x1="2" y1="6" x2="14" y2="6"/><line x1="2" y1="10" x2="14" y2="10"/><line x1="7" y1="2" x2="7" y2="14"/></svg>
+                Google Sheet
+              </button>
+            </div>
+          </div>` : ''}
         <button class="panel-btn minimize-btn" data-action="minimize" data-panel-id="${panel.id}" title="Minimize">&ndash;</button>
         <button class="panel-btn close-btn" data-action="remove" data-panel-id="${panel.id}" title="Remove">&times;</button>
       </div>
@@ -573,43 +900,64 @@ function createPanelElement(panel, index) {
     toggleExpand(panel.id);
   });
 
-  // ── Drag by header ───────────────────────────────────────────────
+  // ── Drag by header (with dead zone) ──────────────────────────────
   header.addEventListener('mousedown', (e) => {
     if (e.target.closest('.panel-actions')) return;
+    if (e.target.closest('.export-menu-wrapper')) return;
     if (e.button !== 0) return;
     e.preventDefault();
 
     const container = document.getElementById('panels');
-    const rect = container.getBoundingClientRect();
     const startX = e.clientX, startY = e.clientY;
     const origX = lay.x, origY = lay.y;
+    let dragging = false;
+    const DRAG_THRESHOLD = 5;
 
-    el.classList.add('dragging');
-    el.style.zIndex = 1000;
-
-    // Overlay to capture mouse over iframes
-    const overlay = document.createElement('div');
-    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:999;cursor:grabbing';
-    document.body.appendChild(overlay);
-
-    // Flow remaining panels into place
-    flowLayout(panel.id);
+    // Overlay to capture mouse over iframes (added only when drag starts)
+    let overlay = null;
 
     const onMove = (ev) => {
-      const nx = Math.max(0, origX + ev.clientX - startX);
-      const ny = Math.max(0, origY + ev.clientY - startY);
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+
+      if (!dragging) {
+        if (Math.abs(dx) < DRAG_THRESHOLD && Math.abs(dy) < DRAG_THRESHOLD) return;
+        // Start drag
+        dragging = true;
+        el.classList.add('dragging');
+        el.style.zIndex = 1000;
+        overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:999;cursor:grabbing';
+        document.body.appendChild(overlay);
+        flowLayout(panel.id);
+      }
+
+      const nx = Math.max(0, origX + dx);
+      const ny = Math.max(0, origY + dy);
       el.style.left = nx + 'px';
       el.style.top = ny + 'px';
       lay.x = nx;
       lay.y = ny;
+
+      // Show drop indicator
+      const cx = nx + lay.w / 2;
+      const cy = ny + lay.h / 2;
+      const oldIdx = panels.findIndex(p => p.id == panel.id);
+      let idx = findInsertIndex(cx, cy, panel.id);
+      if (idx > oldIdx) idx--;
+      showDropIndicator(idx, panel.id);
     };
 
     const onUp = (ev) => {
-      overlay.remove();
-      el.classList.remove('dragging');
-      el.style.zIndex = '';
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
+      hideDropIndicator();
+      if (overlay) overlay.remove();
+      el.classList.remove('dragging');
+      el.style.zIndex = '';
+
+      // If no drag happened, skip reorder
+      if (!dragging) return;
 
       // Find where to insert based on drop position
       const cx = lay.x + lay.w / 2;
@@ -623,6 +971,12 @@ function createPanelElement(panel, index) {
       if (newIdx !== oldIdx) {
         panels.splice(oldIdx, 1);
         panels.splice(newIdx, 0, panel);
+        // Persist new order to server
+        fetch(`${API_BASE}/api/panels/reorder`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ order: panels.map(p => p.id) })
+        }).catch(() => {});
       }
 
       flowLayout();
@@ -711,9 +1065,92 @@ function createPanelElement(panel, index) {
   if (panel.type === 'markdown') {
     body.innerHTML = marked.parse(panel.content || '');
     body.querySelectorAll('pre code').forEach(block => hljs.highlightElement(block));
+    // Show "Export to Sheets" button if content has a table
+    if (body.querySelector('table')) {
+      const sheetsBtn = el.querySelector('.export-sheets-btn');
+      if (sheetsBtn) sheetsBtn.style.display = '';
+    }
   } else if (panel.type === 'embed') {
-    const embedUrl = convertToEmbedUrl(panel.url);
-    body.innerHTML = `<iframe src="${escapeHtml(embedUrl)}" allowfullscreen></iframe>`;
+    const isGoogleUrl = (panel.url || '').includes('docs.google.com');
+    const mime = (panel.mimeType || '').toLowerCase();
+    const purl = panel.url || '';
+    const docType = purl.includes('/document/') || mime.includes('document') ? 'Document'
+      : purl.includes('/spreadsheets/') || mime.includes('spreadsheet') ? 'Spreadsheet'
+      : purl.includes('/presentation/') || mime.includes('presentation') ? 'Presentation' : 'File';
+    const docIcon = docType === 'Document' ? getDriveIcon('document')
+      : docType === 'Spreadsheet' ? getDriveIcon('spreadsheet')
+      : docType === 'Presentation' ? getDriveIcon('presentation')
+      : getDriveIcon('');
+    const docColor = docType === 'Document' ? '#4285F4'
+      : docType === 'Spreadsheet' ? '#0F9D58'
+      : docType === 'Presentation' ? '#F4B400' : '#4285F4';
+
+    if (isGoogleUrl) {
+      if (docType === 'Presentation') {
+        // Google Slides: use iframe embed (works when signed into Google)
+        const embedUrl = convertToEmbedUrl(panel.url, panel.mimeType);
+        body.innerHTML = `<iframe src="${escapeHtml(embedUrl)}" allowfullscreen style="width:100%;height:100%;border:none;"></iframe>`;
+      } else {
+        // Docs/Sheets: show rich preview card (iframes fail for private docs)
+        const docId = ((panel.url || '').match(/\/d\/([a-zA-Z0-9_-]+)/) || (panel.url || '').match(/[?&]id=([a-zA-Z0-9_-]+)/) || [])[1] || '';
+        body.innerHTML = `<div class="embed-preview" data-doc-id="${docId}" data-doc-type="${docType.toLowerCase()}">
+          <div style="display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--border);">
+            <span style="font-size:28px;">${docIcon}</span>
+            <div style="flex:1;min-width:0;">
+              <div style="font-size:15px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(panel.title)}</div>
+              <div style="font-size:12px;color:var(--text-muted);">Google ${docType}</div>
+            </div>
+            <a href="${escapeHtml(panel.url)}" target="_blank" style="display:inline-flex;align-items:center;gap:4px;padding:6px 14px;background:${docColor};color:white;border-radius:16px;text-decoration:none;font-size:12px;font-weight:500;white-space:nowrap;">
+              <span>Open</span>
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h7v7M13 3L6 10"/></svg>
+            </a>
+          </div>
+          <div class="embed-preview-content" style="padding:20px;overflow:auto;flex:1;font-size:13px;line-height:1.6;color:var(--text-muted);">
+            <div style="display:flex;align-items:center;gap:8px;color:var(--text-muted);font-size:12px;">
+              <div class="dot-pulse"><span></span><span></span><span></span></div>
+              Loading preview...
+            </div>
+          </div>
+        </div>`;
+        if (docId && docType !== 'File') {
+          fetch(`${API_BASE}/api/gdrive/preview/${docId}?type=${docType.toLowerCase()}`)
+            .then(r => r.json())
+            .then(data => {
+              const contentEl = body.querySelector('.embed-preview-content');
+              if (!contentEl) return;
+              if (data.ok && data.preview) {
+                if (docType === 'Spreadsheet') {
+                  contentEl.innerHTML = formatSheetPreview(data.preview);
+                } else {
+                  contentEl.innerHTML = `<div style="color:var(--text);white-space:pre-wrap;font-family:inherit;">${escapeHtml(data.preview)}</div>`;
+                }
+              } else {
+                contentEl.innerHTML = `<div style="text-align:center;padding:40px 0;color:var(--text-muted);">
+                  <div style="font-size:32px;margin-bottom:12px;">${docIcon}</div>
+                  <div style="font-size:14px;margin-bottom:4px;">${escapeHtml(panel.title)}</div>
+                  <div style="font-size:12px;">Click "Open" to view in Google ${docType}s</div>
+                </div>`;
+              }
+              flowLayout();
+            })
+            .catch(() => {
+              const contentEl = body.querySelector('.embed-preview-content');
+              if (contentEl) contentEl.innerHTML = `<div style="text-align:center;padding:40px 0;color:var(--text-muted);">Preview unavailable — click Open to view</div>`;
+              flowLayout();
+            });
+        } else {
+          // Unknown file type — show static card, don't attempt preview
+          const contentEl = body.querySelector('.embed-preview-content');
+          if (contentEl) contentEl.innerHTML = `<div style="text-align:center;padding:40px 0;color:var(--text-muted);">
+            <div style="font-size:32px;margin-bottom:12px;">${docIcon}</div>
+            <div style="font-size:14px;">Click "Open" to view in Google Drive</div>
+          </div>`;
+        }
+      }
+    } else {
+      // Non-Google URLs: use iframe
+      body.innerHTML = `<iframe src="${escapeHtml(panel.url)}" allowfullscreen></iframe>`;
+    }
   } else if (panel.type === 'slides') {
     renderSlidesPanel(body, panel);
   } else if (panel.type === 'document') {
@@ -832,16 +1269,23 @@ function exportToGoogle(panelId, exportType) {
   const el = document.querySelector(`.panel[data-id="${panelId}"]`);
   if (!el) return;
 
-  const btn = el.querySelector('.export-btn');
-  const origText = btn.textContent;
-  btn.textContent = 'Exporting...';
-  btn.disabled = true;
+  // Find the right button — either direct .export-btn or the menu toggle
+  const btn = el.querySelector(`.export-btn[data-export-type="${exportType}"]`) || el.querySelector('.export-menu-toggle') || el.querySelector('.export-btn');
+  const toggle = el.querySelector('.export-menu-toggle');
+  const origToggleText = toggle ? toggle.textContent : null;
+  const origBtnText = btn ? btn.textContent : null;
+  if (toggle) { toggle.textContent = 'Exporting...'; toggle.disabled = true; }
+  if (btn) { btn.textContent = 'Exporting...'; btn.disabled = true; }
+  const resetBtn = () => {
+    if (toggle) { toggle.textContent = origToggleText; toggle.disabled = false; }
+    if (btn) { btn.textContent = origBtnText; btn.disabled = false; }
+  };
 
   let prompt;
 
   if (exportType === 'slides') {
     const slides = el._slidesData;
-    if (!slides) { btn.textContent = origText; btn.disabled = false; return; }
+    if (!slides) { resetBtn(); return; }
 
     // Use stored GSLIDES data if available (structured title/body/layout)
     let parsedSlides;
@@ -876,7 +1320,6 @@ function exportToGoogle(panelId, exportType) {
       });
     }
 
-    btn.textContent = 'Exporting...';
     fetch(`${API_BASE}/api/export/slides`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -884,8 +1327,7 @@ function exportToGoogle(panelId, exportType) {
     })
       .then(r => r.json())
       .then(data => {
-        btn.textContent = origText;
-        btn.disabled = false;
+        resetBtn();
         if (data.ok && data.url) {
           if (!chatOpen) toggleChat();
           const presTitle = el._slidesTitle || 'Presentation';
@@ -893,7 +1335,7 @@ function exportToGoogle(panelId, exportType) {
           fetch(`${API_BASE}/api/panel`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ type: 'embed', title: presTitle, url: data.url, manual: true, conversationId: activeConversationId || null })
+            body: JSON.stringify({ type: 'embed', title: presTitle, url: data.url, mimeType: 'application/vnd.google-apps.presentation', manual: true, conversationId: activeConversationId || null })
           });
           addChatMessage('assistant', msg, true);
         } else {
@@ -902,16 +1344,70 @@ function exportToGoogle(panelId, exportType) {
         }
       })
       .catch(() => {
-        btn.textContent = origText;
-        btn.disabled = false;
+        resetBtn();
         if (!chatOpen) toggleChat();
         addChatMessage('assistant', 'Export failed — network error. Try asking Claude Code directly to export.', true);
       });
     return; // Don't fall through to the chat prompt path
+  } else if (exportType === 'sheets') {
+    // Extract table data from the panel's rendered HTML
+    const table = el.querySelector('.panel-body table');
+    if (!table) { resetBtn(); return; }
+
+    const headers = [];
+    table.querySelectorAll('thead th, tr:first-child th').forEach(th => headers.push(th.textContent.trim()));
+    // If no thead, use first row as headers
+    if (headers.length === 0) {
+      const firstRow = table.querySelector('tr');
+      if (firstRow) firstRow.querySelectorAll('td, th').forEach(td => headers.push(td.textContent.trim()));
+    }
+
+    const rows = [];
+    const bodyRows = table.querySelectorAll('tbody tr');
+    const allRows = bodyRows.length > 0 ? bodyRows : table.querySelectorAll('tr');
+    allRows.forEach((tr, i) => {
+      // Skip header row if no thead
+      if (bodyRows.length === 0 && i === 0 && tr.querySelector('th')) return;
+      const cells = [];
+      tr.querySelectorAll('td, th').forEach(td => cells.push(td.textContent.trim()));
+      if (cells.length > 0) rows.push(cells);
+    });
+
+    const panelTitle = el.querySelector('.panel-title')?.textContent || 'Sheet Export';
+
+    fetch(`${API_BASE}/api/export/sheets`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: panelTitle, headers, rows })
+    })
+      .then(r => r.json())
+      .then(data => {
+        resetBtn();
+        if (data.ok && data.url) {
+          if (!chatOpen) toggleChat();
+          addChatMessage('assistant', `**Exported to Google Sheets:**\n\n[${escapeHtml(panelTitle)}](${data.url})`, true);
+          fetch(`${API_BASE}/api/panel`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type: 'embed', title: panelTitle, url: data.url, mimeType: 'application/vnd.google-apps.spreadsheet', manual: true, conversationId: activeConversationId || null })
+          });
+        } else {
+          if (!chatOpen) toggleChat();
+          addChatMessage('assistant', `Export to Sheets failed: ${data.error || 'Unknown error'}`, true);
+        }
+      })
+      .catch(() => {
+        resetBtn();
+        if (!chatOpen) toggleChat();
+        addChatMessage('assistant', 'Export to Sheets failed — network error.', true);
+      });
+    return;
   } else {
-    const content = el._docContent;
-    if (!content) { btn.textContent = origText; btn.disabled = false; return; }
-    prompt = `Create a Google Doc titled "${el._docTitle || 'Document'}" using the gdocs_create MCP tool.
+    // Doc export — works for both document and markdown panels
+    const content = el._docContent || el.querySelector('.panel-body')?.innerHTML;
+    if (!content) { resetBtn(); return; }
+    const docTitle = el._docTitle || el.querySelector('.panel-title')?.textContent || 'Document';
+    prompt = `Create a Google Doc titled "${docTitle}" using the gdocs_create MCP tool.
 
 IMPORTANT: Preserve the formatting from the HTML below. Maintain headings, bold text, bullet points, tables, and overall structure. Here is the HTML content:\n\n${content}\n\nCreate it now with proper formatting and return the URL.`;
   }
@@ -936,8 +1432,24 @@ IMPORTANT: Preserve the formatting from the HTML below. Maintain headings, bold 
 }
 
 
-function convertToEmbedUrl(url) {
+function convertToEmbedUrl(url, mimeType) {
   if (!url) return '';
+  // Handle /open?id= format — convert to proper typed URL first
+  const openMatch = url.match(/docs\.google\.com\/open\?id=([a-zA-Z0-9_-]+)/);
+  if (openMatch) {
+    const id = openMatch[1];
+    const mime = (mimeType || '').toLowerCase();
+    if (mime.includes('presentation')) {
+      return `https://docs.google.com/presentation/d/${id}/embed?start=false&loop=false&delayms=3000`;
+    }
+    if (mime.includes('spreadsheet')) {
+      return `https://docs.google.com/spreadsheets/d/${id}/pubhtml?widget=true&headers=false`;
+    }
+    if (mime.includes('document')) {
+      return `https://docs.google.com/document/d/${id}/preview`;
+    }
+    return url;
+  }
   if (url.includes('docs.google.com/document')) {
     return url.replace(/\/edit.*$/, '/preview');
   }
@@ -1053,25 +1565,57 @@ function undoClose() {
   dismissUndoToast();
 }
 
+// Guard: block panel actions briefly after layout transitions (prevents mis-clicks during animation)
+let _layoutTransitionUntil = 0;
+const _origAutoArrange = autoArrange;
+autoArrange = function(...args) {
+  _layoutTransitionUntil = Date.now() + 400;
+  return _origAutoArrange(...args);
+};
+
 // Single document-level delegation for ALL panel button actions.
-// Uses pointerdown (fires before click, not stolen by iframes).
-// Avoids per-button handlers that break when renderAll() rebuilds DOM mid-event.
-document.addEventListener('pointerdown', (e) => {
-  if (e.button !== 0) return;
+// Uses click (not pointerdown) to avoid firing during drag attempts.
+document.addEventListener('click', (e) => {
   const btn = e.target.closest('[data-action]');
   if (!btn) return;
   // Only handle buttons inside #panels
   if (!btn.closest('#panels')) return;
+  // Block during layout transitions
+  if (Date.now() < _layoutTransitionUntil) return;
+  // Don't act if a drag just ended
+  if (e.target.closest('.dragging')) return;
   e.stopPropagation();
-  e.preventDefault();
   const action = btn.dataset.action;
   const panelId = btn.dataset.panelId;
   if (!panelId) return;
   if (action === 'remove') removePanel(panelId);
   else if (action === 'minimize') toggleMinimize(panelId);
   else if (action === 'edit') startEditing(panelId);
-  else if (action === 'export') exportToGoogle(panelId, btn.dataset.exportType);
-}, true); // capture phase — fires before any per-element handler
+  else if (action === 'export') {
+    // Close the export dropdown if open
+    const wrapper = btn.closest('.export-menu-wrapper');
+    if (wrapper) wrapper.querySelector('.export-menu-dropdown')?.classList.remove('open');
+    exportToGoogle(panelId, btn.dataset.exportType);
+  }
+}, true); // capture phase
+
+// Export menu toggle
+document.addEventListener('click', (e) => {
+  const toggle = e.target.closest('.export-menu-toggle');
+  if (toggle) {
+    e.stopPropagation();
+    // Close all other export menus first
+    document.querySelectorAll('.export-menu-dropdown.open').forEach(d => {
+      if (d !== toggle.nextElementSibling) d.classList.remove('open');
+    });
+    toggle.nextElementSibling?.classList.toggle('open');
+    return;
+  }
+  // Close all export menus when clicking outside
+  if (!e.target.closest('.export-menu-wrapper')) {
+    document.querySelectorAll('.export-menu-dropdown.open').forEach(d => d.classList.remove('open'));
+  }
+});
 
 // Re-flow on window resize + re-scale slides
 window.addEventListener('resize', () => {
@@ -1129,7 +1673,7 @@ function clearAllPanels() {
 }
 
 // ── Presentation mode ──────────────────────────────────────────────
-document.getElementById('btn-present').addEventListener('click', () => {
+document.getElementById('btn-present')?.addEventListener('click', () => {
   if (panels.length === 0) return;
   currentSlide = 0;
   showPresentation();
@@ -1258,12 +1802,68 @@ function toggleChat() {
   setTimeout(flowLayout, 350);
 }
 
+// ── PII detection for file uploads ────────────────────────────
+const PII_PATTERNS = [
+  { pattern: /\b\d{3}-\d{2}-\d{4}\b/g, type: 'SSN' },
+  { pattern: /\b\d{9}\b/g, type: 'SSN (no dashes)' },
+  { pattern: /\b[A-Z]{1,2}\d{6,8}\b/g, type: 'Driver License' },
+  { pattern: /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/g, type: 'Credit Card' },
+  { pattern: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g, type: 'Email' },
+  { pattern: /\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g, type: 'Phone Number' },
+  { pattern: /\b\d{1,5}\s+\w+\s+(?:st|street|ave|avenue|blvd|boulevard|rd|road|ln|lane|dr|drive|ct|court|way|pl|place)\b/gi, type: 'Address' },
+];
+
+function scanForPII(text) {
+  const found = [];
+  for (const { pattern, type } of PII_PATTERNS) {
+    pattern.lastIndex = 0;
+    const matches = text.match(pattern);
+    if (matches && matches.length > 0) {
+      // Filter out false positives: emails are OK in CMT context, phone numbers must be 10+ digits
+      if (type === 'Email') continue; // emails are expected in business files
+      if (type === 'SSN (no dashes)' && matches.every(m => parseInt(m) < 100000000)) continue;
+      found.push({ type, count: matches.length });
+    }
+  }
+  return found;
+}
+
+let piiOverridden = false;
+
+function showPIIWarning(filename, findings) {
+  const container = document.getElementById('chat-file-preview');
+  // Remove any existing PII warning
+  container.querySelectorAll('.pii-warning').forEach(el => el.remove());
+  const types = findings.map(f => `${f.count} ${f.type}${f.count > 1 ? 's' : ''}`).join(', ');
+  const warning = document.createElement('div');
+  warning.className = 'pii-warning';
+  warning.innerHTML = `
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+    <span class="pii-text"><strong>${escapeHtml(filename)}</strong> may contain PII: ${types}</span>
+    <button onclick="this.closest('.pii-warning').remove(); piiOverridden=true;">Send anyway</button>
+  `;
+  container.style.display = 'flex';
+  container.prepend(warning);
+}
+
 document.getElementById('chat-file-input').addEventListener('change', async (e) => {
   const files = e.target.files;
   if (!files.length) return;
+  piiOverridden = false;
 
   for (const file of files) {
     try {
+      // PII scan for text-based files before uploading
+      const textTypes = ['.txt', '.csv', '.tsv', '.json', '.md', '.log', '.xml', '.html', '.sql'];
+      const isTextFile = textTypes.some(ext => file.name.toLowerCase().endsWith(ext)) || file.type.startsWith('text/');
+      if (isTextFile && file.size < 5 * 1024 * 1024) {
+        const content = await file.text();
+        const piiFindings = scanForPII(content);
+        if (piiFindings.length > 0) {
+          showPIIWarning(file.name, piiFindings);
+        }
+      }
+
       const res = await fetch(`${API_BASE}/api/upload`, {
         method: 'POST',
         headers: { 'X-Filename': encodeURIComponent(file.name), 'Content-Type': 'application/octet-stream' },
@@ -1322,6 +1922,16 @@ function sendChat() {
   const input = document.getElementById('chat-input');
   const text = input.value.trim();
   if (!text || chatStreaming) return;
+
+  // Save to message history for arrow key navigation
+  messageHistoryStack.push(text);
+  if (messageHistoryStack.length > 50) messageHistoryStack.shift();
+  messageHistoryIdx = -1;
+  messageHistoryDraft = '';
+
+  // Close slash autocomplete
+  const slashEl = document.getElementById('slash-autocomplete');
+  if (slashEl) { slashEl.classList.remove('open'); slashMenuOpen = false; }
 
   let displayText = text;
   if (attachedFiles.length > 0) {
@@ -1646,6 +2256,69 @@ function applyEditResponse(responseText) {
   }
 }
 
+// ── Skill progress badge ──────────────────────────────────────
+let skillBadgeEl = null;
+let skillStartTime = 0;
+let skillElapsedTimer = null;
+let activeSkillPhase = '';
+
+const SKILL_PHASES = {
+  'Searching Google Drive...': { skill: 'Presentation', phase: 'Researching', icon: '📊' },
+  'Searching Confluence...': { skill: 'Presentation', phase: 'Researching', icon: '📊' },
+  'Reading Google Doc...': { skill: 'Presentation', phase: 'Researching', icon: '📊' },
+  'Reading Google Slides...': { skill: 'Presentation', phase: 'Researching', icon: '📊' },
+  'Creating Google Slides...': { skill: 'Presentation', phase: 'Exporting', icon: '📊' },
+  'Reading Google Sheet...': { skill: 'Chart', phase: 'Reading data', icon: '📈' },
+  'Creating Google Doc...': { skill: 'Document', phase: 'Creating', icon: '📄' },
+  'Updating Google Doc...': { skill: 'Document', phase: 'Updating', icon: '📄' },
+  'Editing Google Doc...': { skill: 'Document', phase: 'Editing', icon: '📄' },
+};
+
+function showSkillBadge(statusText) {
+  const match = SKILL_PHASES[statusText];
+  if (!match) return false;
+
+  if (!skillBadgeEl) {
+    skillBadgeEl = document.createElement('div');
+    skillBadgeEl.className = 'skill-badge';
+    skillBadgeEl.id = 'skill-badge';
+    skillStartTime = Date.now();
+    skillElapsedTimer = setInterval(updateSkillElapsed, 1000);
+  }
+
+  activeSkillPhase = match.phase;
+  skillBadgeEl.innerHTML = `
+    <div class="skill-spinner"></div>
+    <span>${match.icon} ${match.skill}</span>
+    <span class="skill-phase">${match.phase}</span>
+    <span class="skill-elapsed" id="skill-elapsed">0s</span>
+  `;
+
+  const messages = document.getElementById('chat-messages');
+  const existingBadge = document.getElementById('skill-badge');
+  if (!existingBadge) {
+    messages.appendChild(skillBadgeEl);
+    scrollChat();
+  }
+  return true;
+}
+
+function updateSkillElapsed() {
+  const el = document.getElementById('skill-elapsed');
+  if (el) {
+    const secs = Math.floor((Date.now() - skillStartTime) / 1000);
+    el.textContent = secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  }
+}
+
+function removeSkillBadge() {
+  const el = document.getElementById('skill-badge');
+  if (el) el.remove();
+  skillBadgeEl = null;
+  if (skillElapsedTimer) { clearInterval(skillElapsedTimer); skillElapsedTimer = null; }
+  activeSkillPhase = '';
+}
+
 function showStatus() {
   if (document.getElementById('chat-status')) return; // already showing
   removeStatus();
@@ -1657,14 +2330,24 @@ function showStatus() {
   scrollChat();
 }
 
-function updateStatus() {
+function updateStatus(text) {
   if (!document.getElementById('chat-status')) showStatus();
+  // Try to show a skill badge for recognized tool operations
+  if (text && showSkillBadge(text)) {
+    // Update the status text inside the badge
+    const el = document.getElementById('chat-status');
+    if (el) el.querySelector('.dot-pulse')?.parentElement && (el.innerHTML = `<div class="dot-pulse"><span></span><span></span><span></span></div><span style="font-size:11px">${escapeHtml(text)}</span>`);
+  } else if (text) {
+    const el = document.getElementById('chat-status');
+    if (el) el.innerHTML = `<div class="dot-pulse"><span></span><span></span><span></span></div><span style="font-size:11px">${escapeHtml(text)}</span>`;
+  }
 }
 
 function removeStatus() {
   const el = document.getElementById('chat-status');
   if (el) el.remove();
   statusEl = null;
+  removeSkillBadge();
 }
 
 const chatInput = document.getElementById('chat-input');
@@ -1674,7 +2357,136 @@ function autoResizeInput() {
   chatInput.style.height = Math.min(chatInput.scrollHeight, 200) + 'px';
 }
 
+// ── Slash-command autocomplete ─────────────────────────────────
+const SLASH_COMMANDS = [
+  { cmd: '/create-slides', desc: 'Create a branded CMT presentation', icon: '📊' },
+  { cmd: '/create-doc', desc: 'Write a formatted document', icon: '📄' },
+  { cmd: '/create-chart', desc: 'Build a chart visualization', icon: '📈' },
+  { cmd: '/clear', desc: 'Clear all canvas panels', icon: '🗑' },
+];
+let slashMenuOpen = false;
+let slashSelectedIdx = 0;
+
+function getSlashAutocomplete() {
+  let el = document.getElementById('slash-autocomplete');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'slash-autocomplete';
+    el.id = 'slash-autocomplete';
+    document.querySelector('.chat-input-bar').style.position = 'relative';
+    document.querySelector('.chat-input-bar').appendChild(el);
+  }
+  return el;
+}
+
+function updateSlashMenu(text) {
+  const el = getSlashAutocomplete();
+  if (!text.startsWith('/') || text.includes(' ') || text.length > 20) {
+    el.classList.remove('open');
+    slashMenuOpen = false;
+    return;
+  }
+  const q = text.toLowerCase();
+  const matches = SLASH_COMMANDS.filter(c => c.cmd.startsWith(q));
+  if (matches.length === 0) {
+    el.classList.remove('open');
+    slashMenuOpen = false;
+    return;
+  }
+  slashSelectedIdx = Math.min(slashSelectedIdx, matches.length - 1);
+  el.innerHTML = matches.map((c, i) =>
+    `<div class="slash-autocomplete-item${i === slashSelectedIdx ? ' selected' : ''}" data-cmd="${c.cmd}">
+      <span style="font-size:16px">${c.icon}</span>
+      <span class="slash-cmd">${c.cmd}</span>
+      <span class="slash-desc">${c.desc}</span>
+    </div>`
+  ).join('');
+  el.querySelectorAll('.slash-autocomplete-item').forEach(item => {
+    item.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      chatInput.value = item.dataset.cmd + ' ';
+      el.classList.remove('open');
+      slashMenuOpen = false;
+      chatInput.focus();
+      autoResizeInput();
+      updateSendButton();
+    });
+  });
+  el.classList.add('open');
+  slashMenuOpen = true;
+}
+
+chatInput.addEventListener('input', () => {
+  autoResizeInput();
+  updateSendButton();
+  updateSlashMenu(chatInput.value);
+});
+
+// ── Message history navigation (arrow keys) ───────────────────
+let messageHistoryStack = [];
+let messageHistoryIdx = -1;
+let messageHistoryDraft = '';
+
 chatInput.addEventListener('keydown', (e) => {
+  // Slash autocomplete navigation
+  if (slashMenuOpen) {
+    const el = getSlashAutocomplete();
+    const items = el.querySelectorAll('.slash-autocomplete-item');
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      slashSelectedIdx = Math.min(slashSelectedIdx + 1, items.length - 1);
+      updateSlashMenu(chatInput.value);
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      slashSelectedIdx = Math.max(slashSelectedIdx - 1, 0);
+      updateSlashMenu(chatInput.value);
+      return;
+    }
+    if ((e.key === 'Tab' || e.key === 'Enter') && items[slashSelectedIdx]) {
+      e.preventDefault();
+      chatInput.value = items[slashSelectedIdx].dataset.cmd + ' ';
+      el.classList.remove('open');
+      slashMenuOpen = false;
+      autoResizeInput();
+      updateSendButton();
+      return;
+    }
+    if (e.key === 'Escape') {
+      el.classList.remove('open');
+      slashMenuOpen = false;
+      return;
+    }
+  }
+
+  // Arrow up/down for message history (only when input is empty or at start)
+  if (e.key === 'ArrowUp' && chatInput.selectionStart === 0 && !e.shiftKey) {
+    if (messageHistoryStack.length === 0) return;
+    if (messageHistoryIdx === -1) messageHistoryDraft = chatInput.value;
+    if (messageHistoryIdx < messageHistoryStack.length - 1) {
+      messageHistoryIdx++;
+      chatInput.value = messageHistoryStack[messageHistoryStack.length - 1 - messageHistoryIdx];
+      autoResizeInput();
+      updateSendButton();
+      e.preventDefault();
+    }
+    return;
+  }
+  if (e.key === 'ArrowDown' && !e.shiftKey && messageHistoryIdx >= 0) {
+    messageHistoryIdx--;
+    if (messageHistoryIdx < 0) {
+      chatInput.value = messageHistoryDraft;
+    } else {
+      chatInput.value = messageHistoryStack[messageHistoryStack.length - 1 - messageHistoryIdx];
+    }
+    autoResizeInput();
+    updateSendButton();
+    e.preventDefault();
+    return;
+  }
+
+  // Send on Enter
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     sendChat();
@@ -2434,11 +3246,12 @@ function updateChatContext() {
   let ctx = document.getElementById('chat-context');
   const tags = [];
 
-  if (panels.length > 0) tags.push({ text: `${panels.length} panel${panels.length > 1 ? 's' : ''}`, active: false });
+  const convPanels = panels.filter(p => p.conversationId === activeConversationId);
+  if (convPanels.length > 0) tags.push({ text: `${convPanels.length} panel${convPanels.length > 1 ? 's' : ''}`, active: false });
   if (editingPanel) tags.push({ text: `Editing: ${editingPanel.title || editingPanel.type}`, active: true });
 
-  const history = document.querySelectorAll('.chat-msg');
-  const msgCount = history.length;
+  const conv = conversations[activeConversationId];
+  const msgCount = conv && conv.messages ? conv.messages.length : 0;
   if (msgCount > 0) tags.push({ text: `${msgCount} messages`, active: false });
 
   if (tags.length === 0) {
@@ -2479,7 +3292,7 @@ function handleChatMessage(data) {
     _lastGSlidesAttemptLen = 0;
     lastCreatedPanelType = null;
   } else if (data.action === 'chat-status') {
-    if (!streamingElsewhere) updateStatus();
+    if (!streamingElsewhere) updateStatus(data.text);
   } else if (data.action === 'chat-thinking-start') {
     thinkingText = '';
     if (streamingElsewhere) return;
@@ -2636,11 +3449,42 @@ function handleChatMessage(data) {
         addChatMessage(m.role, m.content, m.role === 'assistant', true);
       });
     }
+  } else if (data.action === 'query-result') {
+    // Auto-executed SQL result — render as a table below the chat response
+    const tableHtml = renderQueryTable(data.fields, data.rows, data.rowCount, data.duration, data.sql);
+    const el = addChatMessage('assistant', tableHtml, false);
+    if (el) el.querySelector('.chat-msg-content').classList.add('query-result-msg');
+  } else if (data.action === 'query-error') {
+    addChatMessage('assistant', `**Query error:** ${escapeHtml(data.error)}\n\n\`\`\`sql\n${escapeHtml(data.sql)}...\n\`\`\``, true);
   } else if (data.action === 'chat-error') {
     removeStatus();
     addChatMessage('assistant', 'Error: ' + data.text, false);
     finishChat();
   }
+}
+
+function renderQueryTable(fields, rows, rowCount, duration, sql) {
+  if (!fields || fields.length === 0) return `<p><em>Query returned no columns (${duration}ms)</em></p>`;
+  const maxRows = 100;
+  const displayRows = rows.slice(0, maxRows);
+  let html = `<div class="query-result-table">`;
+  html += `<div class="query-meta">${rowCount} row${rowCount !== 1 ? 's' : ''} · ${duration}ms</div>`;
+  html += `<div class="table-scroll"><table><thead><tr>`;
+  for (const f of fields) html += `<th>${escapeHtml(f)}</th>`;
+  html += `</tr></thead><tbody>`;
+  for (const row of displayRows) {
+    html += '<tr>';
+    for (const f of fields) {
+      const val = row[f];
+      const display = val === null ? '<span class="null">NULL</span>' : escapeHtml(String(val));
+      html += `<td>${display}</td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table></div>';
+  if (rowCount > maxRows) html += `<div class="query-meta">Showing first ${maxRows} of ${rowCount} rows</div>`;
+  html += '</div>';
+  return html;
 }
 
 document.addEventListener('keydown', (e) => {
@@ -2681,17 +3525,93 @@ document.addEventListener('keydown', (e) => {
     clearChatHistory();
     return;
   }
-  // Cmd+P — present
-  if ((e.metaKey || e.ctrlKey) && e.key === 'p') {
-    e.preventDefault();
-    if (panels.length > 0) { currentSlide = 0; showPresentation(); }
-    return;
-  }
+  // Cmd+P — reserved (present feature removed)
 });
 
 function escapeHtml(str) {
   if (!str) return '';
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// Format presentation MCP output into visual slide cards
+function formatSheetPreview(tsv) {
+  const lines = tsv.split('\n');
+  // First line may be "Range: SheetName (N rows)" — show as header
+  let header = '';
+  let dataStart = 0;
+  if (lines[0] && lines[0].startsWith('Range:')) {
+    header = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">${escapeHtml(lines[0])}</div>`;
+    dataStart = lines[1]?.trim() === '' ? 2 : 1;
+  }
+  const dataLines = lines.slice(dataStart).filter(l => l.trim());
+  if (dataLines.length === 0) return header + '<div style="color:var(--text-muted);">Empty sheet</div>';
+
+  let html = header + '<div class="query-result-table"><div class="table-scroll"><table>';
+  // First data line is headers
+  const headers = dataLines[0].split('\t');
+  html += '<thead><tr>';
+  for (const h of headers) html += `<th>${escapeHtml(h)}</th>`;
+  html += '</tr></thead><tbody>';
+  for (let i = 1; i < dataLines.length; i++) {
+    const cells = dataLines[i].split('\t');
+    html += '<tr>';
+    for (let j = 0; j < headers.length; j++) {
+      const val = cells[j] || '';
+      html += `<td>${escapeHtml(val)}</td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table></div></div>';
+  return html;
+}
+
+function formatSlidePreview(raw) {
+  // Parse "--- Slide N ---" blocks
+  const slides = [];
+  const parts = raw.split(/---\s*Slide\s+(\d+)\s*---/i);
+  // parts[0] = header (title, slide count), parts[1]=slideNum, parts[2]=content, ...
+  let header = (parts[0] || '').trim();
+  const titleMatch = header.match(/^#\s*(.+)/m);
+  const countMatch = header.match(/\((\d+)\s*slides?\)/i);
+  const deckTitle = titleMatch ? titleMatch[1].trim() : '';
+  const slideCount = countMatch ? parseInt(countMatch[1]) : 0;
+
+  for (let i = 1; i < parts.length; i += 2) {
+    const num = parseInt(parts[i]);
+    const content = (parts[i + 1] || '').trim();
+    // Split into visible content and notes
+    const notesIdx = content.indexOf('Notes:');
+    const visible = notesIdx >= 0 ? content.slice(0, notesIdx).trim() : content;
+    const notes = notesIdx >= 0 ? content.slice(notesIdx + 6).trim() : '';
+    // First line is usually the title
+    const lines = visible.split('\n').filter(l => l.trim());
+    const slideTitle = lines[0] || `Slide ${num}`;
+    const body = lines.slice(1, 4).join('\n'); // max 3 body lines
+    slides.push({ num, title: slideTitle, body, notes });
+  }
+
+  if (slides.length === 0) {
+    return `<div style="color:var(--text);white-space:pre-wrap;">${raw}</div>`;
+  }
+
+  const maxShow = 12; // show first 12 slides
+  let html = `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;padding:4px;">`;
+  slides.slice(0, maxShow).forEach(s => {
+    html += `<div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;overflow:hidden;cursor:default;" title="${escapeHtml(s.notes || '')}">
+      <div style="background:#F4B400;color:white;padding:4px 10px;font-size:11px;font-weight:600;">Slide ${s.num}</div>
+      <div style="padding:10px 12px;">
+        <div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(s.title)}</div>
+        <div style="font-size:11px;color:var(--text-muted);line-height:1.4;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;">${escapeHtml(s.body)}</div>
+      </div>
+    </div>`;
+  });
+  html += '</div>';
+  if (slides.length > maxShow) {
+    html += `<div style="text-align:center;padding:12px;font-size:12px;color:var(--text-muted);">+ ${slides.length - maxShow} more slides (${slideCount} total)</div>`;
+  } else if (slideCount > slides.length) {
+    html += `<div style="text-align:center;padding:12px;font-size:12px;color:var(--text-muted);">${slideCount} slides total</div>`;
+  }
+  return html;
 }
 
 // ── Google Drive Search ──────────────────────────────────────────
@@ -2819,9 +3739,23 @@ function selectDriveFile(url, name, mimeType) {
   const docMatch = url.match(/\/d\/([a-zA-Z0-9_-]+)/);
   const docId = docMatch ? docMatch[1] : '';
 
-  // Attach as a Google Drive reference — Claude will read it via MCP tools
+  // Create an embed panel on the canvas
+  fetch(`${API_BASE}/api/panel`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      type: 'embed',
+      title: name,
+      url: url,
+      mimeType: mimeType,
+      manual: true,
+      conversationId: activeConversationId || null
+    })
+  });
+
+  // Also attach as a chat reference so Claude can read it via MCP
   attachedFiles.push({
-    path: null, // no local path — server will instruct Claude to read via MCP
+    path: null,
     filename: name,
     size: 0,
     type: 'gdrive',
@@ -2860,8 +3794,14 @@ document.getElementById('btn-add').addEventListener('click', (e) => {
 function closeAddMenu() {
   document.getElementById('add-menu-dropdown').classList.remove('open');
 }
+document.getElementById('btn-arrange').addEventListener('click', (e) => {
+  e.stopPropagation();
+  closeAddMenu();
+  document.getElementById('arrange-dropdown').classList.toggle('open');
+});
 document.addEventListener('click', (e) => {
   if (!e.target.closest('.add-menu-wrapper')) closeAddMenu();
+  if (!e.target.closest('.arrange-wrapper')) closeArrangeMenu();
 });
 
 // ── Quick prompts from empty state ───────────────────────────────

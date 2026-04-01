@@ -43,7 +43,59 @@
           </button>
         </div>
       </div>
-      <button id="btn-present" class="btn btn-accent" title="Present panels as slides">Present</button>
+      <div class="arrange-wrapper">
+        <button id="btn-arrange" class="btn" title="Auto-arrange panels">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="1" width="6" height="6" rx="1"/><rect x="9" y="1" width="6" height="6" rx="1"/><rect x="1" y="9" width="6" height="6" rx="1"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
+          <span>Arrange</span>
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 4L5 6.5L7.5 4"/></svg>
+        </button>
+        <div class="arrange-dropdown" id="arrange-dropdown">
+          <div class="arrange-section">
+            <div class="arrange-label">Layout</div>
+            <button onclick="autoArrange('auto')" class="arrange-opt" data-layout="auto">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1" y="1" width="6" height="6" rx="1"/><rect x="9" y="1" width="6" height="6" rx="1"/><rect x="1" y="9" width="6" height="6" rx="1"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
+              Auto
+            </button>
+            <button onclick="autoArrange('2-col')" class="arrange-opt" data-layout="2-col">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1" y="1" width="6" height="14" rx="1"/><rect x="9" y="1" width="6" height="14" rx="1"/></svg>
+              2 Columns
+            </button>
+            <button onclick="autoArrange('3-col')" class="arrange-opt" data-layout="3-col">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1" y="1" width="4" height="14" rx="0.5"/><rect x="6" y="1" width="4" height="14" rx="0.5"/><rect x="11" y="1" width="4" height="14" rx="0.5"/></svg>
+              3 Columns
+            </button>
+            <button onclick="autoArrange('1-col')" class="arrange-opt" data-layout="1-col">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="3" y="1" width="10" height="14" rx="1"/></svg>
+              Single Column
+            </button>
+            <button onclick="autoArrange('masonry')" class="arrange-opt" data-layout="masonry">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="1" y="1" width="6" height="8" rx="1"/><rect x="9" y="1" width="6" height="5" rx="1"/><rect x="1" y="11" width="6" height="4" rx="1"/><rect x="9" y="8" width="6" height="7" rx="1"/></svg>
+              Masonry
+            </button>
+          </div>
+          <div class="arrange-divider"></div>
+          <div class="arrange-section">
+            <div class="arrange-label">Sort</div>
+            <button onclick="arrangeSort('type')">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="2" y="3" width="5" height="4" rx="0.5"/><rect x="9" y="3" width="5" height="4" rx="0.5"/><rect x="2" y="9" width="5" height="4" rx="0.5"/><rect x="9" y="9" width="5" height="4" rx="0.5"/></svg>
+              By Type
+            </button>
+            <button onclick="arrangeSort('newest')">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M8 2v8M5 7l3 3 3-3"/><line x1="3" y1="13" x2="13" y2="13"/></svg>
+              Newest First
+            </button>
+            <button onclick="arrangeSort('oldest')">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M8 10V2M5 5l3-3 3 3"/><line x1="3" y1="13" x2="13" y2="13"/></svg>
+              Oldest First
+            </button>
+            <button onclick="arrangeSort('name')">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3 3h4M3 6h3M3 9h2M3 12h5"/><path d="M11 4v8M9 10l2 2 2-2"/></svg>
+              By Name
+            </button>
+          </div>
+        </div>
+      </div>
+      <!-- Present button removed -->
       <button id="btn-chat" class="btn btn-chat">Hide Chat</button>
       <div class="settings-wrapper">
         <button id="btn-settings" class="btn" title="Settings">
@@ -143,9 +195,9 @@
         <div><span class="kbd">&#8984;K</span> Toggle chat</div>
         <div><span class="kbd">&#8984;/</span> Show shortcuts</div>
         <div><span class="kbd">&#8984;N</span> New chat</div>
-        <div><span class="kbd">&#8984;P</span> Present</div>
         <div><span class="kbd">Esc</span> Close panel / modal</div>
         <div><span class="kbd">Dbl-click</span> Expand panel</div>
+        <div><span class="kbd">Drag header</span> Reorder panels</div>
       </div>
       <div class="modal-actions">
         <button class="btn" onclick="document.getElementById('shortcuts-modal').classList.remove('active')">Close</button>

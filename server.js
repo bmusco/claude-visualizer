@@ -86,7 +86,7 @@ function nextPanelId() {
 
 // API: push content to the visualizer
 app.post('/api/panel', (req, res) => {
-  const { type, title, content, url, manual } = req.body;
+  const { type, title, content, url, mimeType, manual } = req.body;
 
   // Only allow embed panels from explicit user actions (embed modal, Drive picker)
   // This prevents research docs from appearing as panels during chat
@@ -96,10 +96,12 @@ app.post('/api/panel', (req, res) => {
 
   // Dedup embed panels by Google Doc ID
   if (type === 'embed' && url) {
-    const docIdMatch = url.match(/\/d\/([^/]+)/);
+    const docIdMatch = url.match(/\/d\/([^/]+)/) || url.match(/[?&]id=([a-zA-Z0-9_-]+)/);
     if (docIdMatch) {
-      const existing = panels.find(p => p.url && p.url.includes(docIdMatch[1]));
+      const existing = panels.find(p => p.url && (p.url.includes(docIdMatch[1]) || p.url.includes('/d/' + docIdMatch[1])));
       if (existing) {
+        // Update mimeType on existing panel if newly provided
+        if (mimeType && !existing.mimeType) { existing.mimeType = mimeType; savePanels(); }
         return res.json({ ok: true, id: existing.id, duplicate: true });
       }
     }
@@ -107,6 +109,7 @@ app.post('/api/panel', (req, res) => {
 
   const conversationId = req.body.conversationId || null;
   const panel = { id: nextPanelId(), type, title, content, url, conversationId, timestamp: new Date().toISOString() };
+  if (mimeType) panel.mimeType = mimeType;
   panels.push(panel);
   savePanels();
   broadcast({ action: 'add', panel });
@@ -118,6 +121,19 @@ app.post('/api/clear', (req, res) => {
   panels = [];
   savePanels();
   broadcast({ action: 'clear' });
+  res.json({ ok: true });
+});
+
+// API: reorder panels
+app.post('/api/panels/reorder', (req, res) => {
+  const { order } = req.body;
+  if (!Array.isArray(order)) return res.status(400).json({ ok: false, error: 'order array required' });
+  const byId = new Map(panels.map(p => [p.id, p]));
+  const reordered = order.map(id => byId.get(id)).filter(Boolean);
+  // Append any panels not in the order array (safety)
+  panels.forEach(p => { if (!order.includes(p.id)) reordered.push(p); });
+  panels = reordered;
+  savePanels();
   res.json({ ok: true });
 });
 
@@ -457,6 +473,91 @@ app.post('/api/config/reauth/:server', (req, res) => {
   res.json({ ok: result.status === 0, output: output.slice(0, 300) });
 });
 
+// ── Direct SQL query endpoint (Option A) ──────────────────────────
+const { Pool } = require('pg');
+const pgPool = new Pool({
+  user: 'bmusco@cmtelematics.com',
+  host: '127.0.0.1',
+  port: 13626,
+  password: 'magic',
+  database: 'prod_redshift',
+  ssl: false,
+  connectionTimeoutMillis: 10000,
+  query_timeout: 120000,
+});
+
+// Query result cache: sql hash -> { rows, fields, ts }
+const queryCache = new Map();
+const QUERY_CACHE_TTL = 5 * 60 * 1000; // 5 min
+
+function sqlCacheKey(sql) {
+  return require('crypto').createHash('md5').update(sql.trim()).digest('hex');
+}
+
+app.post('/api/query', express.json(), async (req, res) => {
+  const { sql, database } = req.body;
+  if (!sql) return res.status(400).json({ ok: false, error: 'Missing sql parameter' });
+
+  // Basic safety: block destructive statements
+  const upper = sql.trim().toUpperCase();
+  if (/^\s*(DROP|DELETE|TRUNCATE|ALTER|INSERT|UPDATE|CREATE|GRANT|REVOKE)\b/.test(upper)) {
+    return res.status(403).json({ ok: false, error: 'Only SELECT queries are allowed' });
+  }
+
+  // Check cache
+  const cacheKey = sqlCacheKey(sql + (database || ''));
+  const cached = queryCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < QUERY_CACHE_TTL) {
+    return res.json({ ok: true, rows: cached.rows, fields: cached.fields, cached: true, duration: cached.duration });
+  }
+
+  const db = database || 'prod_redshift';
+  const start = Date.now();
+  try {
+    // Use a one-off client if database differs from pool default
+    let client;
+    let needRelease = false;
+    if (db !== 'prod_redshift') {
+      const { Client } = require('pg');
+      client = new Client({
+        user: 'bmusco@cmtelematics.com',
+        host: '127.0.0.1',
+        port: 13626,
+        password: 'magic',
+        database: db,
+        ssl: false,
+      });
+      await client.connect();
+      needRelease = true;
+    } else {
+      client = await pgPool.connect();
+      needRelease = true;
+    }
+
+    try {
+      const result = await client.query(sql);
+      const duration = Date.now() - start;
+      const fields = result.fields ? result.fields.map(f => f.name) : [];
+      const rows = result.rows || [];
+
+      // Cache result
+      queryCache.set(cacheKey, { rows, fields, ts: Date.now(), duration });
+
+      res.json({ ok: true, rows, fields, rowCount: rows.length, duration });
+    } finally {
+      if (needRelease) {
+        if (db !== 'prod_redshift') {
+          client.end().catch(() => {});
+        } else {
+          client.release();
+        }
+      }
+    }
+  } catch (err) {
+    res.json({ ok: false, error: err.message, duration: Date.now() - start });
+  }
+});
+
 // ── Auto-name chat ─────────────────────────────────────────────────
 app.post('/api/chat-title', (req, res) => {
   const { messages } = req.body;
@@ -486,71 +587,178 @@ app.post('/api/chat-title', (req, res) => {
 
 // ── Google Drive search with caching ─────────────────────────────
 const driveCache = new Map(); // query -> { files, ts }
-const CACHE_TTL = 10 * 60 * 1000; // 10 min cache (Drive files don't change that fast)
-const STALE_TTL = 30 * 60 * 1000; // serve stale for 30 min while refreshing
+const CACHE_TTL = 30 * 60 * 1000; // 30 min cache (Drive files don't change that fast)
+const STALE_TTL = 2 * 60 * 60 * 1000; // serve stale for 2 hours while refreshing
 let activeFetches = new Map(); // query -> Promise — dedup concurrent requests
+
+// ── Direct MCP connection (bypasses Claude CLI for ~10x faster Drive search) ──
+const MCP_GOOGLE_URL = 'https://portal.int-tools.cmtelematics.com/google-workspace-mcp/mcp';
+let mcpAccessToken = null;
+let directMcpAvailable = false;
+
+function loadMcpTokensFromKeychain() {
+  try {
+    const result = execSync(
+      'security find-generic-password -s "Claude Code-credentials" -g 2>&1',
+      { encoding: 'utf-8', timeout: 5000 }
+    );
+    const pwMatch = result.match(/^password: "(.*)"$/m);
+    if (!pwMatch) return false;
+    const creds = JSON.parse(pwMatch[1]);
+    const gw = Object.values(creds.mcpOAuth || {}).find(
+      v => v.serverName === 'google-workspace'
+    );
+    if (!gw?.accessToken) return false;
+    mcpAccessToken = gw.accessToken;
+    return true;
+  } catch { return false; }
+}
+
+// Stateless MCP tool call — server doesn't require sessions
+function mcpCallTool(toolName, args) {
+  const https = require('https');
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      jsonrpc: '2.0', method: 'tools/call', id: Date.now(),
+      params: { name: toolName, arguments: args }
+    });
+    const req = https.request(MCP_GOOGLE_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        'Authorization': `Bearer ${mcpAccessToken}`,
+      }
+    }, (res) => {
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        // Token expired — reload from keychain (Claude CLI may have refreshed it)
+        res.resume();
+        if (loadMcpTokensFromKeychain()) {
+          mcpCallTool(toolName, args).then(resolve);
+        } else {
+          directMcpAvailable = false;
+          resolve(null);
+        }
+        return;
+      }
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        try {
+          // SSE format: event: message\ndata: {...}\n\n
+          const dataMatch = data.match(/^data:\s*(.+)$/m);
+          if (dataMatch) { resolve(JSON.parse(dataMatch[1])); return; }
+          resolve(JSON.parse(data));
+        } catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
+    req.write(body);
+    req.end();
+  });
+}
+
+function parseDriveResults(mcpResult) {
+  if (!mcpResult?.result?.content) return [];
+  const files = [];
+  for (const item of mcpResult.result.content) {
+    if (item.type !== 'text' || !item.text) continue;
+    try {
+      const parsed = JSON.parse(item.text);
+      const arr = Array.isArray(parsed) ? parsed : (parsed.files || []);
+      for (const f of arr) {
+        if (f.id) files.push({
+          id: f.id,
+          name: f.name || f.title || 'Untitled',
+          mimeType: f.mimeType || '',
+          webViewLink: f.webViewLink || f.webUrl || f.url || ''
+        });
+      }
+    } catch {}
+  }
+  return files;
+}
 
 function fetchDriveFilesAsync(query) {
   const cacheKey = query.toLowerCase().trim();
-  // Dedup: if a fetch for this query is already in-flight, return the same promise
   if (activeFetches.has(cacheKey)) return activeFetches.get(cacheKey);
 
-  const promise = new Promise((resolve) => {
-    const prompt = query
-      ? `Use the mcp__google-workspace__gdrive_search tool to search for "${query}". Return ONLY a raw JSON array of objects with fields: id, name, mimeType, webViewLink. No markdown, no explanation, no code fences, just the JSON array.`
-      : `Use the mcp__google-workspace__gdrive_search tool to list recent files (query: "modifiedTime > '${new Date(Date.now() - 30*24*60*60*1000).toISOString().split('T')[0]}'"). Return ONLY a raw JSON array of objects with fields: id, name, mimeType, webViewLink. No markdown, no explanation, no code fences, just the JSON array.`;
+  const promise = (async () => {
+    let files = [];
 
-    // Use async spawn (non-blocking) for speed
-    const cliArgs = ['-p', '--output-format', 'text', prompt];
-    const proc = spawn(CLAUDE_CLI, cliArgs, {
-      env: { ...process.env, HOME: USER_HOME },
-      cwd: USER_HOME
-    });
+    // FAST PATH: Direct MCP call (~1s vs ~15s via Claude CLI)
+    if (directMcpAvailable) {
+      try {
+        const driveQuery = query || ' '; // space = recent files
+        const result = await mcpCallTool('gdrive_search', { query: driveQuery });
+        files = parseDriveResults(result);
+      } catch {}
+    }
 
-    let output = '';
-    const timer = setTimeout(() => { proc.kill(); resolve([]); }, 30000);
+    // FALLBACK: Claude CLI (if direct MCP failed or unavailable)
+    if (files.length === 0 && !directMcpAvailable) {
+      files = await new Promise((resolve) => {
+        const prompt = query
+          ? `Use the mcp__google-workspace__gdrive_search tool to search for "${query}". Return ONLY a raw JSON array of objects with fields: id, name, mimeType, webViewLink. No markdown, no explanation, no code fences, just the JSON array.`
+          : `Use the mcp__google-workspace__gdrive_search tool to list recent files (query: "modifiedTime > '${new Date(Date.now() - 30*24*60*60*1000).toISOString().split('T')[0]}'"). Return ONLY a raw JSON array of objects with fields: id, name, mimeType, webViewLink. No markdown, no explanation, no code fences, just the JSON array.`;
 
-    proc.stdout.on('data', d => { output += d.toString(); });
-    proc.stderr.on('data', d => { output += d.toString(); });
-    proc.on('close', () => {
-      clearTimeout(timer);
-      const jsonMatch = output.match(/\[[\s\S]*\]/);
-      let files = [];
-      if (jsonMatch) {
-        try { files = JSON.parse(jsonMatch[0]); } catch {}
-      }
-      // Update cache (don't cache empty results for default query — likely a transient failure)
-      if (files.length > 0 || cacheKey) {
-        const entry = { files, ts: Date.now() };
-        driveCache.set(cacheKey, entry);
-      }
-      activeFetches.delete(cacheKey);
-      resolve(files);
-    });
-    proc.on('error', () => { clearTimeout(timer); activeFetches.delete(cacheKey); resolve([]); });
-  });
+        const proc = spawn(CLAUDE_CLI, ['-p', '--output-format', 'text', prompt], {
+          env: { ...process.env, HOME: USER_HOME },
+          cwd: USER_HOME
+        });
+        let output = '';
+        const timer = setTimeout(() => { proc.kill(); resolve([]); }, 30000);
+        proc.stdout.on('data', d => { output += d.toString(); });
+        proc.stderr.on('data', d => { output += d.toString(); });
+        proc.on('close', () => {
+          clearTimeout(timer);
+          const jsonMatch = output.match(/\[[\s\S]*\]/);
+          let f = [];
+          if (jsonMatch) { try { f = JSON.parse(jsonMatch[0]); } catch {} }
+          resolve(f);
+        });
+        proc.on('error', () => { clearTimeout(timer); resolve([]); });
+      });
+    }
+
+    // Update cache
+    if (files.length > 0 || cacheKey) {
+      driveCache.set(cacheKey, { files, ts: Date.now() });
+    }
+    activeFetches.delete(cacheKey);
+    return files;
+  })();
 
   activeFetches.set(cacheKey, promise);
   return promise;
 }
 
-// Pre-fetch recent files on server start (only if Google Workspace MCP is configured)
-setTimeout(() => {
-  try {
-    const settingsPaths = [
-      path.join(__dirname, '..', '.claude', 'settings.local.json'),
-      path.join(os.homedir(), '.claude', 'settings.json'),
-    ];
-    const hasGoogleMcp = settingsPaths.some(sp => {
-      try {
-        const s = JSON.parse(fs.readFileSync(sp, 'utf-8'));
-        const allowed = s.permissions?.allow || [];
-        return allowed.some(r => r.startsWith('mcp__google-workspace'));
-      } catch { return false; }
-    });
-    if (hasGoogleMcp) fetchDriveFilesAsync('');
-  } catch {}
-}, 2000);
+// Initialize direct MCP on server start
+setTimeout(async () => {
+  if (loadMcpTokensFromKeychain()) {
+    directMcpAvailable = true;
+    console.log('[MCP] Direct Google Workspace token loaded (fast mode ~1s vs ~15s)');
+  }
+  // Pre-fetch recent files
+  fetchDriveFilesAsync('');
+  setTimeout(() => fetchDriveFilesAsync('mimeType:application/vnd.google-apps.presentation'), 3000);
+}, 500);
+
+// Fast server-side fuzzy filter across ALL cached Drive files
+function fuzzyFilterCache(query) {
+  if (!query) return null;
+  const q = query.toLowerCase();
+  const allFiles = new Map(); // dedup by id
+  for (const [, entry] of driveCache) {
+    for (const f of entry.files) {
+      if (f.id && !allFiles.has(f.id) && (f.name || '').toLowerCase().includes(q)) {
+        allFiles.set(f.id, f);
+      }
+    }
+  }
+  return allFiles.size > 0 ? [...allFiles.values()] : null;
+}
 
 app.get('/api/gdrive/search', async (req, res) => {
   const query = req.query.q || '';
@@ -571,9 +779,84 @@ app.get('/api/gdrive/search', async (req, res) => {
     return;
   }
 
+  // FAST PATH: fuzzy-filter across all cached files for instant results
+  // while the real search runs in the background
+  const fuzzyResults = fuzzyFilterCache(query);
+  if (fuzzyResults) {
+    res.json({ ok: true, files: fuzzyResults, cached: true, fuzzy: true, refreshing: true });
+    fetchDriveFilesAsync(query); // fire-and-forget full search
+    return;
+  }
+
   // No cache at all — must wait for results (but async, doesn't block server)
   const files = await fetchDriveFilesAsync(query);
   res.json({ ok: true, files });
+});
+
+// ── Google Doc preview (reads content via direct MCP) ────────────
+const docPreviewCache = new Map(); // docId -> { preview, ts }
+const DOC_PREVIEW_TTL = 10 * 60 * 1000; // 10 min
+
+app.get('/api/gdrive/preview/:docId', async (req, res) => {
+  const { docId } = req.params;
+  const docType = req.query.type || 'document';
+  if (!docId) return res.json({ ok: false, error: 'docId required' });
+
+  // Check cache
+  const cached = docPreviewCache.get(docId);
+  if (cached && Date.now() - cached.ts < DOC_PREVIEW_TTL) {
+    return res.json({ ok: true, preview: cached.preview });
+  }
+
+  if (!directMcpAvailable) {
+    return res.json({ ok: false, error: 'MCP not available' });
+  }
+
+  try {
+    let toolName, args;
+    if (docType === 'spreadsheet') {
+      // Discover actual sheet name first (may not be "Sheet1")
+      const meta = await mcpCallTool('gsheets_get', { spreadsheet_id: docId });
+      let sheetName = 'Sheet1';
+      try {
+        const metaText = meta?.result?.content?.find(c => c.type === 'text')?.text || '';
+        const metaJson = JSON.parse(metaText);
+        if (metaJson.sheets && metaJson.sheets.length > 0) {
+          sheetName = metaJson.sheets[0].name;
+        }
+      } catch {}
+      toolName = 'gsheets_read';
+      args = { spreadsheet_id: docId, range: sheetName };
+    } else if (docType === 'presentation') {
+      toolName = 'gslides_read';
+      args = { presentation_id: docId };
+    } else {
+      toolName = 'gdocs_read';
+      args = { document_id: docId };
+    }
+
+    const result = await mcpCallTool(toolName, args);
+    if (!result?.result?.content) {
+      return res.json({ ok: false, error: 'No content returned' });
+    }
+
+    let preview = '';
+    for (const item of result.result.content) {
+      if (item.type === 'text') {
+        preview += item.text;
+      }
+    }
+
+    // Truncate for preview (first ~3000 chars, HTML-escaped)
+    preview = preview.slice(0, 3000)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    if (preview.length >= 3000) preview += '\n\n... (truncated)';
+
+    docPreviewCache.set(docId, { preview, ts: Date.now() });
+    res.json({ ok: true, preview });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
 });
 
 app.put('/api/config/model', (req, res) => {
@@ -650,7 +933,7 @@ wss.on('connection', (ws) => {
     ws.send(JSON.stringify({ action: 'chat-history', messages: chatHistory }));
   }
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
@@ -667,8 +950,38 @@ wss.on('connection', (ws) => {
 
       ws.send(JSON.stringify({ action: 'chat-start' }));
 
-      // Build prompt with file context
+      // ── Expand slash commands into natural language prompts ──
+      // Skills from ~/.claude/skills/ don't work in -p mode, so we
+      // intercept /command patterns and rewrite them here.
       let userMessage = prompt;
+
+      const slashMatch = prompt.match(/^\/create-slides\s+(.*)/i);
+      let preSearchPromise = null;
+      if (slashMatch) {
+        const topic = slashMatch[1].trim();
+        // Check for slide count (e.g., "/create-slides 5 on byod")
+        const countMatch = topic.match(/^(\d+)\s+(?:on\s+|about\s+|for\s+)?(.+)/i);
+        const slideTopic = countMatch ? countMatch[2] : topic;
+        const slideCount = countMatch ? countMatch[1] : '5-7';
+
+        // Pre-fetch Drive results NOW while we build the prompt (saves 5-15s)
+        preSearchPromise = Promise.all([
+          fetchDriveFilesAsync(slideTopic),
+          fetchDriveFilesAsync(slideTopic + ' mimeType:application/vnd.google-apps.presentation'),
+        ]).then(([allFiles, slideFiles]) => {
+          // Merge and dedup by id
+          const seen = new Set();
+          const merged = [];
+          // Prioritize presentations
+          for (const f of [...slideFiles, ...allFiles]) {
+            if (f.id && !seen.has(f.id)) { seen.add(f.id); merged.push(f); }
+          }
+          return merged.slice(0, 10);
+        });
+
+        userMessage = `Create a ${slideCount}-slide presentation about: ${slideTopic}`;
+      }
+
       if (files.length > 0) {
         const localFiles = [];
         const driveFiles = [];
@@ -705,6 +1018,27 @@ wss.on('connection', (ws) => {
           }).join('\n');
           userMessage += `\n\nIMPORTANT: The user has attached Google Drive files. Read them FIRST before responding:\n${driveInstructions}\n\nUse the content from these files to inform your response.`;
         }
+      }
+
+      // ── Inject pre-fetched Drive results for /create-slides ──
+      if (preSearchPromise) {
+        try {
+          const driveResults = await preSearchPromise;
+          if (driveResults.length > 0) {
+            const fileList = driveResults.map(f => {
+              const type = (f.mimeType || '').includes('presentation') ? 'Slides'
+                : (f.mimeType || '').includes('document') ? 'Doc'
+                : (f.mimeType || '').includes('spreadsheet') ? 'Sheet' : 'File';
+              return `  - [${type}] "${f.name}" (ID: ${f.id})`;
+            }).join('\n');
+            const readInstructions = driveResults
+              .filter(f => (f.mimeType || '').includes('presentation'))
+              .slice(0, 3)
+              .map(f => `Read these slides for reusable messaging: mcp__google-workspace__gslides_read with presentation ID "${f.id}"`)
+              .join('\n');
+            userMessage += `\n\n[PRE-FETCHED DRIVE RESULTS — skip gdrive_search, these are already the search results for this topic]\n${fileList}\n\n${readInstructions ? 'PRIORITIZE reading the presentations listed above for reusable content. ' : ''}Go straight to reading the most relevant 1-2 files, then create the GSLIDES output. Do NOT call gdrive_search again — use these results.`;
+          }
+        } catch {}
       }
 
       // Build full prompt with conversation history
@@ -878,8 +1212,70 @@ wss.on('connection', (ws) => {
         // stderr may contain progress info; don't double-up thinking status
       });
 
-      claude.on('close', (code) => {
+      claude.on('close', async (code) => {
         chatSessions.delete(ws);
+
+        // ── Option C: Auto-execute SQL code blocks from Claude's output ──
+        // Detect ```sql blocks and run them directly, much faster than
+        // waiting for Claude to call Bash -> psql
+        const sqlBlockRegex = /```sql\n([\s\S]*?)```/g;
+        let sqlMatch;
+        const sqlBlocks = [];
+        while ((sqlMatch = sqlBlockRegex.exec(output)) !== null) {
+          const sql = sqlMatch[1].trim();
+          // Only auto-execute SELECT queries
+          if (/^\s*SELECT\b/i.test(sql) || /^\s*WITH\b/i.test(sql)) {
+            sqlBlocks.push(sql);
+          }
+        }
+
+        if (sqlBlocks.length > 0) {
+          for (const sql of sqlBlocks) {
+            try {
+              ws.send(JSON.stringify({ action: 'chat-status', text: 'Running query...' }));
+              const start = Date.now();
+
+              // Check cache first
+              const cacheKey = sqlCacheKey(sql);
+              const cached = queryCache.get(cacheKey);
+              let rows, fields, duration;
+
+              if (cached && Date.now() - cached.ts < QUERY_CACHE_TTL) {
+                rows = cached.rows;
+                fields = cached.fields;
+                duration = cached.duration;
+              } else {
+                const client = await pgPool.connect();
+                try {
+                  const result = await client.query(sql);
+                  duration = Date.now() - start;
+                  fields = result.fields ? result.fields.map(f => f.name) : [];
+                  rows = result.rows || [];
+                  queryCache.set(cacheKey, { rows, fields, ts: Date.now(), duration });
+                } finally {
+                  client.release();
+                }
+              }
+
+              // Send query results to the UI
+              ws.send(JSON.stringify({
+                action: 'query-result',
+                sql: sql.slice(0, 200),
+                fields,
+                rows: rows.slice(0, 1000), // cap at 1000 rows for the UI
+                rowCount: rows.length,
+                duration,
+              }));
+            } catch (err) {
+              ws.send(JSON.stringify({
+                action: 'query-error',
+                sql: sql.slice(0, 200),
+                error: err.message,
+              }));
+            }
+          }
+        }
+
         // Save assistant response to history
         if (output) {
           chatHistory.push({ role: 'assistant', content: output });
@@ -938,28 +1334,37 @@ app.post('/api/export/slides', async (req, res) => {
   try {
     const payload = JSON.stringify({ title, slides });
 
-    // Use POST to avoid URL length limits for large presentations
+    // Apps Script redirects POST responses to a googleusercontent URL.
+    // Don't auto-follow — grab the Location header, then GET it for the JSON result.
     const resp = await fetch(APPS_SCRIPT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: payload,
-      redirect: 'follow'
+      redirect: 'manual'
     });
-    const text = await resp.text();
+
     let data;
-    try { data = JSON.parse(text); } catch {
-      // Apps Script may redirect POST to GET — try GET fallback for small payloads
-      if (payload.length < 7000) {
-        const url = `${APPS_SCRIPT_URL}?data=${encodeURIComponent(payload)}`;
-        const resp2 = await fetch(url, { redirect: 'follow' });
+    if (resp.status >= 300 && resp.status < 400) {
+      // Follow the redirect with GET to retrieve the JSON response
+      const location = resp.headers.get('location');
+      if (location) {
+        const resp2 = await fetch(location, { redirect: 'follow' });
         data = await resp2.json();
       } else {
-        return res.json({ ok: false, error: `Apps Script returned non-JSON: ${text.slice(0, 200)}` });
+        return res.json({ ok: false, error: 'Apps Script redirect missing Location header' });
       }
+    } else {
+      data = await resp.json();
     }
 
     if (data.ok && data.url) {
-      return res.json({ ok: true, url: data.url });
+      // Normalize /open?id= URLs to /presentation/d/ID/edit for proper type detection
+      let url = data.url;
+      const openIdMatch = url.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+      if (openIdMatch && !url.includes('/presentation/')) {
+        url = `https://docs.google.com/presentation/d/${openIdMatch[1]}/edit`;
+      }
+      return res.json({ ok: true, url });
     }
     res.json({ ok: false, error: data.error || 'Apps Script returned no URL' });
   } catch (err) {
@@ -1014,6 +1419,44 @@ app.get('/api/memories', (req, res) => {
     res.json({ ok: true, memories, indexContent });
   } catch (err) {
     res.json({ ok: false, error: err.message, memories: [] });
+  }
+});
+
+// ── Export table data to Google Sheets ─────────────────────────────
+app.post('/api/export/sheets', async (req, res) => {
+  const { title, headers, rows } = req.body;
+  if (!title || !headers || !rows) return res.json({ ok: false, error: 'title, headers, and rows required' });
+  if (!directMcpAvailable) return res.json({ ok: false, error: 'MCP not available' });
+
+  try {
+    // Create the spreadsheet
+    const createResult = await mcpCallTool('gsheets_create', { title });
+    const createText = createResult?.result?.content?.find(c => c.type === 'text')?.text || '';
+    // Extract spreadsheet ID from response
+    let spreadsheetId;
+    try {
+      const createJson = JSON.parse(createText);
+      spreadsheetId = createJson.spreadsheet_id || createJson.spreadsheetId || createJson.id;
+    } catch {
+      // Try to extract ID from URL in response
+      const urlMatch = createText.match(/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
+      if (urlMatch) spreadsheetId = urlMatch[1];
+    }
+    if (!spreadsheetId) return res.json({ ok: false, error: 'Could not get spreadsheet ID from creation response' });
+
+    // Build the data array: headers + rows
+    const allRows = [headers, ...rows];
+    // Convert to the format gsheets_update expects
+    await mcpCallTool('gsheets_update', {
+      spreadsheet_id: spreadsheetId,
+      range: 'Sheet1',
+      values: allRows
+    });
+
+    const url = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+    res.json({ ok: true, url });
+  } catch (err) {
+    res.json({ ok: false, error: err.message });
   }
 });
 

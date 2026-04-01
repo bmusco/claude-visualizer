@@ -4275,10 +4275,10 @@ function renderSettingsModal() {
           <span class="integration-card-name">Google Workspace</span>
           <span class="integration-card-desc">Connect your Google account to give the assistant read-only access to Gmail, Calendar, Drive, Docs, Slides, and Tasks.</span>
         </div>
-        <span class="integration-badge checking" id="badge-google-workspace">Checking...</span>
+        <span class="integration-badge ${config.oauthStatus?.['google-workspace'] ? 'connected' : 'disconnected'}" id="badge-google-workspace">${config.oauthStatus?.['google-workspace'] ? 'Connected' : 'Not Connected'}</span>
       </div>
       <div class="integration-card-actions" id="actions-google-workspace">
-        <button class="settings-action-btn connect-btn" id="connect-btn-google-workspace" onclick="connectIntegration('google-workspace', 'Google', this)">Connect Google Account</button>
+        <button class="settings-action-btn connect-btn" id="connect-btn-google-workspace" onclick="connectIntegration('google-workspace', 'Google', this)">${config.oauthStatus?.['google-workspace'] ? 'Reconnect' : 'Connect Google Account'}</button>
       </div>
       <div class="settings-status-msg" id="status-google-workspace"></div>
     </div>
@@ -4293,10 +4293,10 @@ function renderSettingsModal() {
           <span class="integration-card-name">Slack</span>
           <span class="integration-card-desc">Connect your Slack account to search messages, read channels, and browse threads.</span>
         </div>
-        <span class="integration-badge checking" id="badge-slack">Checking...</span>
+        <span class="integration-badge ${config.oauthStatus?.['slack'] ? 'connected' : 'disconnected'}" id="badge-slack">${config.oauthStatus?.['slack'] ? 'Connected' : 'Not Connected'}</span>
       </div>
       <div class="integration-card-actions" id="actions-slack">
-        <button class="settings-action-btn connect-btn" id="connect-btn-slack" onclick="connectIntegration('slack', 'Slack', this)">Connect Slack</button>
+        <button class="settings-action-btn connect-btn" id="connect-btn-slack" onclick="connectIntegration('slack', 'Slack', this)">${config.oauthStatus?.['slack'] ? 'Reconnect' : 'Connect Slack'}</button>
       </div>
       <div class="settings-status-msg" id="status-slack"></div>
     </div>

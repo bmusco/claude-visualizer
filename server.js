@@ -661,7 +661,21 @@ function formatMcpName(raw) {
 }
 
 app.get('/api/config', (req, res) => {
-  res.json(getConfig());
+  const config = getConfig();
+  // Include per-user OAuth status in config response
+  const oauthStatus = {};
+  let session = req.userSession;
+  if (!session?.tokens || Object.keys(session.tokens).length === 0) {
+    for (const [, sess] of userTokenStore) {
+      if (sess.tokens && Object.keys(sess.tokens).length > 0) { session = sess; break; }
+    }
+  }
+  for (const provider of ['google-workspace', 'slack']) {
+    const td = session?.tokens?.[provider];
+    oauthStatus[provider] = !!(td?.accessToken);
+  }
+  config.oauthStatus = oauthStatus;
+  res.json(config);
 });
 
 // Test MCP connection by running a simple tool call

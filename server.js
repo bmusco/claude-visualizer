@@ -1275,9 +1275,84 @@ function saveChatHistory() {
 // Load system prompt from file
 const SYSTEM_PROMPT = fs.readFileSync(path.join(__dirname, 'system-prompt.md'), 'utf-8').replace(/\x00/g, '');
 
-wss.on('connection', (ws) => {
+// ── MCP intent detection + pre-fetch ─────────────────────────────
+const MCP_GOOGLE_BASE = 'https://portal.int-tools.cmtelematics.com/google-workspace-mcp/mcp';
+
+function detectMcpIntent(prompt) {
+  const lower = prompt.toLowerCase();
+  const intents = [];
+
+  if (/\b(email|gmail|inbox|unread|mail)\b/.test(lower)) {
+    let query = 'is:unread';
+    const fromMatch = lower.match(/(?:from|email from)\s+(\S+)/);
+    if (fromMatch) query = `from:${fromMatch[1]}`;
+    const aboutMatch = lower.match(/(?:about|subject|regarding)\s+"?([^"]+)"?/);
+    if (aboutMatch) query = `subject:${aboutMatch[1].trim()}`;
+    intents.push({ provider: 'google-workspace', tool: 'gmail_search', args: { query, max_results: 10 }, label: 'Searching Gmail...' });
+  }
+
+  if (/\b(calendar|schedule|meeting|event|agenda|today'?s?\s+meeting)\b/.test(lower)) {
+    const now = new Date();
+    const endOfDay = new Date(now);
+    endOfDay.setHours(23, 59, 59);
+    intents.push({ provider: 'google-workspace', tool: 'gcal_list_events', args: {
+      time_min: now.toISOString(),
+      time_max: endOfDay.toISOString(),
+      max_results: 20,
+    }, label: 'Checking calendar...' });
+  }
+
+  if (/\b(task|todo|to-do|tasks)\b/.test(lower) && !/redshift|sql|query/.test(lower)) {
+    intents.push({ provider: 'google-workspace', tool: 'gtasks_list', args: { max_results: 50 }, label: 'Loading tasks...' });
+  }
+
+  if (/\b(search\s+drive|find\s+(?:in\s+)?drive|google\s+doc|drive\s+for)\b/.test(lower)) {
+    const queryMatch = lower.match(/(?:search\s+drive\s+for|find\s+in\s+drive|drive\s+for)\s+"?([^"]+)"?/);
+    if (queryMatch) {
+      intents.push({ provider: 'google-workspace', tool: 'gdrive_search', args: { query: queryMatch[1].trim() }, label: 'Searching Drive...' });
+    }
+  }
+
+  return intents;
+}
+
+async function executeMcpPreFetch(intents, userToken) {
+  if (!userToken || intents.length === 0) return [];
+  const results = [];
+  for (const intent of intents) {
+    try {
+      const mcpUrl = MCP_GOOGLE_BASE;
+      const result = await mcpCallToolWithToken(intent.tool, intent.args, userToken, mcpUrl);
+      if (result?.result?.content) {
+        let text = '';
+        for (const item of result.result.content) {
+          if (item.type === 'text') text += item.text;
+        }
+        if (text) results.push({ tool: intent.tool, data: text });
+      }
+    } catch (err) {
+      console.error(`[MCP PRE-FETCH] ${intent.tool} failed:`, err.message);
+    }
+  }
+  return results;
+}
+
+function parseCookieHeader(cookieStr) {
+  const cookies = {};
+  if (!cookieStr) return cookies;
+  cookieStr.split(';').forEach(pair => {
+    const [k, ...v] = pair.trim().split('=');
+    if (k) cookies[k.trim()] = v.join('=').trim();
+  });
+  return cookies;
+}
+
+wss.on('connection', (ws, req) => {
+  const cookies = parseCookieHeader(req.headers.cookie);
+  ws.sessionId = cookies.claudio_sid || null;
+  ws.userSession = ws.sessionId ? userTokenStore.get(ws.sessionId) : null;
+
   ws.send(JSON.stringify({ action: 'init', panels }));
-  // Send existing chat history to client on reconnect
   if (chatHistory.length > 0) {
     ws.send(JSON.stringify({ action: 'chat-history', messages: chatHistory }));
   }
@@ -1390,6 +1465,28 @@ wss.on('connection', (ws) => {
         } catch {}
       }
 
+      // ── MCP pre-fetch: detect intent and fetch data with per-user tokens ──
+      let mcpPreFetched = false;
+      const mcpIntents = detectMcpIntent(userMessage);
+      if (mcpIntents.length > 0 && ws.userSession) {
+        const googleToken = ws.userSession.tokens?.['google-workspace'];
+        let accessToken = googleToken?.accessToken ? decryptToken(googleToken.accessToken) : null;
+
+        if (accessToken) {
+          for (const intent of mcpIntents) {
+            ws.send(JSON.stringify({ action: 'chat-status', text: intent.label }));
+          }
+          const fetchResults = await executeMcpPreFetch(mcpIntents, accessToken);
+          if (fetchResults.length > 0) {
+            mcpPreFetched = true;
+            const dataBlock = fetchResults.map(r =>
+              `\n[PRE-FETCHED ${r.tool.toUpperCase()} DATA — use this data to answer the user's question]\n${r.data}`
+            ).join('\n');
+            userMessage += dataBlock;
+          }
+        }
+      }
+
       // Build full prompt with conversation history
       let fullPrompt = SYSTEM_PROMPT + '\n\n';
       if (chatHistory.length > 0) {
@@ -1409,8 +1506,9 @@ wss.on('connection', (ws) => {
       fullPrompt = fullPrompt.replace(/\x00/g, '');
 
       // ── Quick mode vs Normal mode ──
+      // Force quick mode when MCP data was pre-fetched (no need for CLI to connect to MCP)
       const isEditing = !!msg.editingPanel;
-      const skipMcp = canSkipMcp(userMessage, isEditing);
+      const skipMcp = mcpPreFetched || canSkipMcp(userMessage, isEditing);
 
       const cliArgs = ['-p', '--verbose', '--output-format', 'stream-json', '--include-partial-messages'];
       if (selectedModel) cliArgs.push('--model', selectedModel);
@@ -1418,7 +1516,6 @@ wss.on('connection', (ws) => {
       // Quick mode: skip MCP servers entirely (saves 2-5s connection overhead)
       if (skipMcp) {
         cliArgs.push('--strict-mcp-config');
-        // No --mcp-config means no MCP servers loaded
       }
 
       // Warm session: resume previous session for this conversation

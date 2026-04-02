@@ -354,6 +354,106 @@ function saveAtlassianCredentials(btn) {
     });
 }
 
+function saveDbCredentials(btn) {
+  const accessKeyId = document.getElementById('db-access-key')?.value?.trim();
+  const secretAccessKey = document.getElementById('db-secret-key')?.value?.trim();
+  const sessionToken = document.getElementById('db-session-token')?.value?.trim();
+  const expiration = document.getElementById('db-expiration')?.value?.trim() || null;
+  const badge = document.getElementById('badge-database');
+  const statusMsg = document.getElementById('status-database');
+
+  if (!accessKeyId || !secretAccessKey || !sessionToken) {
+    if (statusMsg) { statusMsg.textContent = 'All three credential fields are required.'; statusMsg.className = 'settings-status-msg err'; }
+    return;
+  }
+
+  btn.textContent = 'Saving...';
+  btn.disabled = true;
+
+  fetch(`${API_BASE}/api/db-credentials`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accessKeyId, secretAccessKey, sessionToken, expiration })
+  })
+    .then(r => r.json())
+    .then(data => {
+      if (data.ok) {
+        if (badge) { badge.textContent = 'Active'; badge.className = 'integration-badge connected'; }
+        if (statusMsg) { statusMsg.textContent = 'Credentials saved. Prod Redshift queries are now enabled.'; statusMsg.className = 'settings-status-msg ok'; }
+        dismissDbBanner();
+      } else {
+        if (badge) { badge.textContent = 'Error'; badge.className = 'integration-badge disconnected'; }
+        if (statusMsg) { statusMsg.textContent = data.error || 'Failed to save'; statusMsg.className = 'settings-status-msg err'; }
+      }
+      btn.textContent = 'Save Database Credentials';
+      btn.disabled = false;
+    })
+    .catch(() => {
+      if (statusMsg) { statusMsg.textContent = 'Error saving credentials'; statusMsg.className = 'settings-status-msg err'; }
+      btn.textContent = 'Save Database Credentials';
+      btn.disabled = false;
+    });
+}
+
+function autoFillDbCredentials(btn) {
+  const origText = btn.textContent;
+  btn.textContent = 'Fetching...';
+  btn.disabled = true;
+
+  fetch(`${API_BASE}/api/config/aws-credentials`, { method: 'POST' })
+    .then(r => r.json())
+    .then(data => {
+      if (data.ok) {
+        document.getElementById('db-access-key').value = data.accessKeyId || '';
+        document.getElementById('db-secret-key').value = data.secretAccessKey || '';
+        document.getElementById('db-session-token').value = data.sessionToken || '';
+        document.getElementById('db-expiration').value = data.expiration || '';
+        const statusMsg = document.getElementById('status-database');
+        if (statusMsg) { statusMsg.textContent = 'Fields populated. Click Save to apply.'; statusMsg.className = 'settings-status-msg ok'; }
+      } else {
+        const statusMsg = document.getElementById('status-database');
+        if (statusMsg) { statusMsg.textContent = data.error || 'Could not read local credentials. Paste them manually.'; statusMsg.className = 'settings-status-msg err'; }
+      }
+      btn.textContent = origText;
+      btn.disabled = false;
+    })
+    .catch(() => {
+      btn.textContent = origText;
+      btn.disabled = false;
+    });
+}
+
+function checkDbCredentialStatus() {
+  fetch(`${API_BASE}/api/db-credentials`).then(r => r.json()).then(data => {
+    const badge = document.getElementById('badge-database');
+    if (!badge) return;
+    if (data.pgproxyAvailable) {
+      badge.textContent = 'pgproxy'; badge.className = 'integration-badge connected';
+    } else if (data.status === 'valid') {
+      badge.textContent = 'Active'; badge.className = 'integration-badge connected';
+    } else if (data.status === 'expired') {
+      badge.textContent = 'Expired'; badge.className = 'integration-badge disconnected';
+      showDbBanner('Database credentials have expired. Open Settings to refresh them.');
+    } else {
+      badge.textContent = 'Not Configured'; badge.className = 'integration-badge disconnected';
+    }
+  }).catch(() => {});
+}
+
+function showDbBanner(msg) {
+  if (document.getElementById('db-cred-banner')) return;
+  const banner = document.createElement('div');
+  banner.id = 'db-cred-banner';
+  banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:10000;background:#FEF3C7;border-bottom:2px solid #F59E0B;padding:10px 20px;display:flex;align-items:center;gap:12px;font-size:14px;color:#92400E;';
+  banner.innerHTML = `<span style="font-size:18px">&#9888;</span><span style="flex:1">${msg}</span><button onclick="document.getElementById('db-cred-banner').remove();openSettingsModal()" style="background:#F59E0B;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;font-size:13px">Open Settings</button><button onclick="this.parentElement.remove()" style="background:none;border:none;cursor:pointer;font-size:18px;color:#92400E">&times;</button>`;
+  document.body.prepend(banner);
+}
+
+function dismissDbBanner() {
+  const banner = document.getElementById('db-cred-banner');
+  if (banner) banner.remove();
+}
+
 function refreshAws(btn) {
   const origText = btn.textContent;
   btn.textContent = 'Refreshing...';
@@ -3536,6 +3636,11 @@ function handleChatMessage(data) {
     }
     thinkingEl = null;
   } else if (data.action === 'chat-chunk') {
+    // Show banner if DB credentials issue detected
+    if (data.text && data.text.includes('DB_CREDENTIALS_')) {
+      const isExpired = data.text.includes('DB_CREDENTIALS_EXPIRED');
+      showDbBanner(isExpired ? 'Database credentials have expired. Open Settings to refresh them.' : 'Database credentials not configured. Open Settings to add your AWS credentials.');
+    }
     currentResponseText += data.text;
     // Still scan for GSLIDES/panels even if viewing another conv (panels are global)
     liveScanGSlides(currentResponseText);
@@ -4456,6 +4561,30 @@ function renderSettingsModal() {
       </div>
       <div class="settings-status-msg" id="status-atlassian"></div>
     </div>
+
+    <!-- Database Credentials (prod Redshift access when pgproxy unavailable) -->
+    <div class="integration-card" id="server-database">
+      <div class="integration-card-header">
+        <span class="integration-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><ellipse cx="12" cy="5" rx="9" ry="3" stroke="#527FFF" stroke-width="2"/><path d="M3 5v6c0 1.66 4.03 3 9 3s9-1.34 9-3V5" stroke="#527FFF" stroke-width="2"/><path d="M3 11v6c0 1.66 4.03 3 9 3s9-1.34 9-3v-6" stroke="#527FFF" stroke-width="2"/></svg>
+        </span>
+        <div class="integration-card-info">
+          <span class="integration-card-name">Database Credentials</span>
+          <span class="integration-card-desc">Provide AWS credentials for prod Redshift queries. Run <code>cmtaws sso login</code>, then paste the credentials below. Expires in ~12 hours.</span>
+        </div>
+        <span class="integration-badge checking" id="badge-database">Checking...</span>
+      </div>
+      <div class="integration-instructions">After running <code>cmtaws sso login</code>, get your credentials:<br><code style="font-size:11px">aws configure get aws_access_key_id --profile cmtelematics-sso-user</code></div>
+      <input type="text" class="integration-field" id="db-access-key" placeholder="AWS Access Key ID">
+      <input type="password" class="integration-field" id="db-secret-key" placeholder="AWS Secret Access Key">
+      <input type="password" class="integration-field" id="db-session-token" placeholder="AWS Session Token">
+      <input type="text" class="integration-field" id="db-expiration" placeholder="Expiration (optional, e.g. 2026-04-02T14:00:00Z)">
+      <div class="integration-card-actions" id="actions-database">
+        <button class="settings-action-btn connect-btn" id="connect-btn-database" onclick="saveDbCredentials(this)">Save Database Credentials</button>
+        <button class="settings-action-btn" onclick="autoFillDbCredentials(this)" style="margin-left:8px">Auto-fill from CLI</button>
+      </div>
+      <div class="settings-status-msg" id="status-database"></div>
+    </div>
   </div>`;
 
   // Sources
@@ -4486,6 +4615,7 @@ function renderSettingsModal() {
 
   // Check per-user OAuth status for integrations
   ['google-workspace', 'slack'].forEach(checkUserAuthStatus);
+  checkDbCredentialStatus();
 }
 
 function clearAllMemories() {

@@ -824,6 +824,34 @@ app.delete('/api/integrations/:server/tokens', (req, res) => {
   res.json({ ok: true, message: `To fully disconnect ${serverName}, run /mcp in the Claude CLI` });
 });
 
+// Auto-fill: read local AWS credentials for the cmtelematics-sso-user profile
+app.post('/api/config/aws-credentials', (req, res) => {
+  try {
+    const credFile = path.join(os.homedir(), '.aws', 'credentials');
+    if (!fs.existsSync(credFile)) return res.json({ ok: false, error: 'No ~/.aws/credentials file found' });
+
+    const content = fs.readFileSync(credFile, 'utf-8');
+    const profile = 'cmtelematics-sso-user';
+    const profileRegex = new RegExp(`\\[${profile}\\]([\\s\\S]*?)(?=\\n\\[|$)`);
+    const match = content.match(profileRegex);
+    if (!match) return res.json({ ok: false, error: `Profile [${profile}] not found in credentials` });
+
+    const section = match[1];
+    const get = (key) => { const m = section.match(new RegExp(`${key}\\s*=\\s*(.+)`)); return m ? m[1].trim() : ''; };
+
+    const accessKeyId = get('aws_access_key_id');
+    const secretAccessKey = get('aws_secret_access_key');
+    const sessionToken = get('aws_session_token');
+    const expiration = get('aws_session_expiration');
+
+    if (!accessKeyId || !secretAccessKey) return res.json({ ok: false, error: 'Credentials incomplete — run cmtaws sso login first' });
+
+    res.json({ ok: true, accessKeyId, secretAccessKey, sessionToken, expiration });
+  } catch (err) {
+    res.json({ ok: false, error: err.message });
+  }
+});
+
 // Refresh AWS SSO credentials
 app.post('/api/config/refresh-aws', (req, res) => {
   try {
@@ -864,7 +892,6 @@ app.post('/api/config/reauth/:server', (req, res) => {
 // ── Database queries: pgproxy (local dev) + Redshift Data API (ECS fallback) ──
 const { Pool } = require('pg');
 const { RedshiftDataClient, ExecuteStatementCommand, DescribeStatementCommand, GetStatementResultCommand } = require('@aws-sdk/client-redshift-data');
-const { STSClient, AssumeRoleCommand } = require('@aws-sdk/client-sts');
 
 // pgproxy config (works on dev laptops with cmtaws sso login)
 const PGPROXY_HOST = process.env.PGPROXY_HOST || '127.0.0.1';
@@ -873,41 +900,79 @@ const PGPROXY_USER = process.env.PGPROXY_USER || 'bmusco@cmtelematics.com';
 const PGPROXY_PASSWORD = process.env.PGPROXY_PASSWORD || 'magic';
 const DEFAULT_DATABASE = process.env.DEFAULT_DATABASE || 'prod_redshift';
 
-// Redshift Serverless Data API config (prod account, cross-account from ECS)
+// Redshift Serverless Data API config (prod — uses credentials from UI)
 const REDSHIFT_WORKGROUP = process.env.REDSHIFT_WORKGROUP || 'prod-research';
 const REDSHIFT_DATABASE = process.env.REDSHIFT_DATABASE || 'prod_vtrack';
 const REDSHIFT_REGION = process.env.REDSHIFT_REGION || 'us-west-2';
-const REDSHIFT_CROSS_ACCOUNT_ROLE = process.env.REDSHIFT_CROSS_ACCOUNT_ROLE || 'arn:aws:iam::062438643287:role/claudio-redshift-query';
 
-// Create a Redshift Data API client with cross-account credentials
-const stsClient = new STSClient({ region: REDSHIFT_REGION });
-let redshiftDataClient = null;
-let redshiftCredentialsExpiry = 0;
+// Stored prod AWS credentials (set via UI, persisted to disk)
+const DB_CRED_PATH = path.join(os.homedir(), '.claude', 'mcp-credentials', 'db-credentials.json');
+let dbCredentials = null; // { accessKeyId, secretAccessKey, sessionToken, expiration, updatedAt }
+let redshiftClient = null;
 
-async function getRedshiftClient() {
-  // Re-use client if credentials are still valid (refresh 5 min before expiry)
-  if (redshiftDataClient && Date.now() < redshiftCredentialsExpiry - 300000) {
-    return redshiftDataClient;
+function loadDbCredentials() {
+  try {
+    if (fs.existsSync(DB_CRED_PATH)) {
+      dbCredentials = JSON.parse(fs.readFileSync(DB_CRED_PATH, 'utf-8'));
+      redshiftClient = new RedshiftDataClient({
+        region: REDSHIFT_REGION,
+        credentials: {
+          accessKeyId: dbCredentials.accessKeyId,
+          secretAccessKey: dbCredentials.secretAccessKey,
+          sessionToken: dbCredentials.sessionToken,
+        },
+      });
+      console.log('[DB] Loaded prod credentials from disk (updated:', dbCredentials.updatedAt, ')');
+    }
+  } catch (err) {
+    console.error('[DB] Failed to load credentials:', err.message);
   }
-  console.log('[DB] Assuming cross-account role for Redshift Data API...');
-  const assumeResp = await stsClient.send(new AssumeRoleCommand({
-    RoleArn: REDSHIFT_CROSS_ACCOUNT_ROLE,
-    RoleSessionName: 'claudio-redshift',
-    DurationSeconds: 3600,
-  }));
-  const creds = assumeResp.Credentials;
-  redshiftDataClient = new RedshiftDataClient({
-    region: REDSHIFT_REGION,
-    credentials: {
-      accessKeyId: creds.AccessKeyId,
-      secretAccessKey: creds.SecretAccessKey,
-      sessionToken: creds.SessionToken,
-    },
-  });
-  redshiftCredentialsExpiry = creds.Expiration.getTime();
-  console.log('[DB] Redshift Data API client ready (expires', creds.Expiration.toISOString(), ')');
-  return redshiftDataClient;
 }
+loadDbCredentials();
+
+function dbCredentialsValid() {
+  if (!dbCredentials) return false;
+  if (dbCredentials.expiration && new Date(dbCredentials.expiration) < new Date()) return false;
+  return true;
+}
+
+function getDbCredentialStatus() {
+  if (!dbCredentials) return { status: 'missing', message: 'No database credentials configured' };
+  if (dbCredentials.expiration && new Date(dbCredentials.expiration) < new Date()) {
+    return { status: 'expired', message: 'Database credentials expired', expiration: dbCredentials.expiration, updatedAt: dbCredentials.updatedAt };
+  }
+  return { status: 'valid', message: 'Database credentials active', expiration: dbCredentials.expiration, updatedAt: dbCredentials.updatedAt };
+}
+
+// API: save/check database credentials
+app.get('/api/db-credentials', (req, res) => {
+  res.json({ ok: true, ...getDbCredentialStatus(), pgproxyAvailable });
+});
+
+app.post('/api/db-credentials', express.json(), (req, res) => {
+  const { accessKeyId, secretAccessKey, sessionToken, expiration } = req.body;
+  if (!accessKeyId || !secretAccessKey || !sessionToken) {
+    return res.status(400).json({ ok: false, error: 'accessKeyId, secretAccessKey, and sessionToken are required' });
+  }
+
+  dbCredentials = { accessKeyId, secretAccessKey, sessionToken, expiration: expiration || null, updatedAt: new Date().toISOString() };
+  redshiftClient = new RedshiftDataClient({
+    region: REDSHIFT_REGION,
+    credentials: { accessKeyId, secretAccessKey, sessionToken },
+  });
+
+  // Persist to disk
+  try {
+    const credDir = path.dirname(DB_CRED_PATH);
+    fs.mkdirSync(credDir, { recursive: true });
+    fs.writeFileSync(DB_CRED_PATH, JSON.stringify(dbCredentials, null, 2));
+  } catch (err) {
+    console.error('[DB] Failed to persist credentials:', err.message);
+  }
+
+  console.log('[DB] Prod credentials updated via UI');
+  res.json({ ok: true, message: 'Database credentials saved', ...getDbCredentialStatus() });
+});
 
 // Detect pgproxy availability at startup — if unreachable, use Redshift Data API
 let pgproxyAvailable = null; // null = not checked yet
@@ -925,7 +990,7 @@ async function checkPgproxy() {
     console.log('[DB] pgproxy available — using pgproxy for all queries');
   } catch {
     pgproxyAvailable = false;
-    console.log('[DB] pgproxy unavailable — using Redshift Data API (Aurora queries disabled)');
+    console.log('[DB] pgproxy unavailable — will use Redshift Data API with stored credentials');
   }
 }
 checkPgproxy();
@@ -974,10 +1039,14 @@ function isAuroraQuery(database) {
   return database && database.includes('clone');
 }
 
-// Redshift Serverless Data API executor (ECS fallback, cross-account)
+// Redshift Serverless Data API executor (prod, uses stored credentials)
 async function executeRedshiftDataApi(sql) {
-  const client = await getRedshiftClient();
-  const execResp = await client.send(new ExecuteStatementCommand({
+  if (!redshiftClient || !dbCredentialsValid()) {
+    const status = getDbCredentialStatus();
+    throw new Error(`DB_CREDENTIALS_${status.status.toUpperCase()}: ${status.message}. Open Settings to add your AWS credentials.`);
+  }
+
+  const execResp = await redshiftClient.send(new ExecuteStatementCommand({
     WorkgroupName: REDSHIFT_WORKGROUP,
     Database: REDSHIFT_DATABASE,
     Sql: sql,
@@ -986,7 +1055,7 @@ async function executeRedshiftDataApi(sql) {
   let status = 'SUBMITTED', attempts = 0;
   while (status !== 'FINISHED' && status !== 'FAILED' && status !== 'ABORTED' && attempts < 60) {
     await new Promise(r => setTimeout(r, attempts < 5 ? 500 : 2000));
-    const desc = await client.send(new DescribeStatementCommand({ Id: execResp.Id }));
+    const desc = await redshiftClient.send(new DescribeStatementCommand({ Id: execResp.Id }));
     status = desc.Status;
     if (status === 'FAILED') throw new Error(desc.Error || 'Query failed');
     if (status === 'ABORTED') throw new Error('Query aborted');
@@ -994,7 +1063,7 @@ async function executeRedshiftDataApi(sql) {
   }
   if (status !== 'FINISHED') throw new Error('Query timeout after 120s');
 
-  const result = await client.send(new GetStatementResultCommand({ Id: execResp.Id }));
+  const result = await redshiftClient.send(new GetStatementResultCommand({ Id: execResp.Id }));
   const fields = (result.ColumnMetadata || []).map(c => c.name);
   const rows = (result.Records || []).map(record =>
     Object.fromEntries(fields.map((f, i) => [f, record[i].stringValue ?? record[i].longValue ?? record[i].doubleValue ?? record[i].booleanValue ?? null]))
@@ -1019,7 +1088,7 @@ async function executeQuery(sql, database) {
     throw new Error(`Aurora queries (${db}) require pgproxy which is not available in this environment. This query references Aurora-only tables. Try rephrasing to use Redshift analytics tables instead.`);
   }
 
-  // Fall back to Redshift Data API
+  // Fall back to Redshift Data API with stored prod credentials
   const { fields, rows } = await executeRedshiftDataApi(sql);
   return { fields, rows, database: db };
 }

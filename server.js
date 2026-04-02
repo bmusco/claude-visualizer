@@ -1925,19 +1925,18 @@ wss.on('connection', (ws, req) => {
       claude.on('close', async (code) => {
         chatSessions.delete(ws);
 
-        // ── Option C: Auto-execute SQL code blocks from Claude's output ──
-        // Detect ```sql blocks and run them directly, much faster than
-        // waiting for Claude to call Bash -> psql
+        // ── Auto-execute SQL code blocks from Claude's output ──
         const sqlBlockRegex = /```sql\n([\s\S]*?)```/g;
         let sqlMatch;
         const sqlBlocks = [];
+        console.log(`[SQL-DETECT] Output length: ${output.length}, contains sql block: ${output.includes('```sql')}`);
         while ((sqlMatch = sqlBlockRegex.exec(output)) !== null) {
           const sql = sqlMatch[1].trim();
-          // Only auto-execute SELECT queries
           if (/^\s*SELECT\b/i.test(sql) || /^\s*WITH\b/i.test(sql)) {
             sqlBlocks.push(sql);
           }
         }
+        console.log(`[SQL-DETECT] Found ${sqlBlocks.length} SQL blocks to execute`);
 
         if (sqlBlocks.length > 0) {
           for (const sql of sqlBlocks) {

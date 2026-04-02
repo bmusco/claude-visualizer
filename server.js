@@ -1980,6 +1980,46 @@ wss.on('connection', (ws, req) => {
               const errText = `\n\n**Query error:** ${err.message}\n`;
               output += errText;
               ws.send(JSON.stringify({ action: 'chat-chunk', text: errText }));
+
+              // Auto-retry: feed error back to Claude for a fix
+              if (!sql._retried) {
+                console.log(`[SQL-EXEC] Retrying with error context...`);
+                ws.send(JSON.stringify({ action: 'chat-chunk', text: '\n\nRetrying with corrected query...\n' }));
+                const retryPrompt = `The SQL query failed with this error: ${err.message}\n\nFailed query:\n\`\`\`sql\n${sql}\n\`\`\`\n\nFix the query and output a corrected \`\`\`sql block. If the column doesn't exist, try SELECT * FROM the table LIMIT 1 first to discover the correct column names.`;
+                const retryResult = spawnSync(CLAUDE_CLI, ['-p', '--output-format', 'text', '--max-turns', '1', retryPrompt], {
+                  encoding: 'utf-8',
+                  timeout: 30000,
+                  env: { ...process.env, HOME: USER_HOME },
+                  cwd: USER_HOME
+                });
+                const retryOutput = (retryResult.stdout || '').trim();
+                if (retryOutput) {
+                  ws.send(JSON.stringify({ action: 'chat-chunk', text: '\n' + retryOutput }));
+                  output += '\n' + retryOutput;
+                  const retryMatch = retryOutput.match(/```sql\n([\s\S]*?)```/);
+                  if (retryMatch) {
+                    const retrySql = retryMatch[1].trim();
+                    if (/^\s*(SELECT|WITH)\b/i.test(retrySql)) {
+                      try {
+                        const retryRes = await executeRedshiftQuery(retrySql);
+                        let retryText = `\n\n**Corrected query results** (${retryRes.rows.length} rows):\n\n`;
+                        if (retryRes.fields.length > 0 && retryRes.rows.length > 0) {
+                          retryText += '| ' + retryRes.fields.join(' | ') + ' |\n';
+                          retryText += '| ' + retryRes.fields.map(() => '---').join(' | ') + ' |\n';
+                          for (const row of retryRes.rows.slice(0, 50)) {
+                            retryText += '| ' + retryRes.fields.map(f => String(row[f] ?? '')).join(' | ') + ' |\n';
+                          }
+                        }
+                        output += retryText;
+                        ws.send(JSON.stringify({ action: 'chat-chunk', text: retryText }));
+                        queryCache.set(sqlCacheKey(retrySql), { rows: retryRes.rows, fields: retryRes.fields, ts: Date.now(), duration: 0 });
+                      } catch (retryErr) {
+                        ws.send(JSON.stringify({ action: 'chat-chunk', text: `\n**Retry also failed:** ${retryErr.message}\n` }));
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }

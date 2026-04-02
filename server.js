@@ -2174,7 +2174,8 @@ wss.on('connection', (ws, req) => {
             } else if (parsed.type === 'result' || eventType === 'result') {
               const result = parsed.result || event.result;
               if (result) {
-                output = result;
+                // Don't overwrite output — it has the full streamed content including SQL blocks
+                // The result is a plain-text summary that strips markdown
                 ws.send(JSON.stringify({ action: 'chat-result', text: result }));
               }
               // Capture session ID for warm subprocess resumption
@@ -2196,7 +2197,7 @@ wss.on('connection', (ws, req) => {
       });
 
       claude.on('close', async (code) => {
-        console.log(`[CHAT] Claude process closed with code ${code}, output length: ${output.length}`);
+        console.log(`[CHAT] Claude process closed with code ${code}, output length: ${output.length}, has sql: ${/```sql/.test(output)}`);
         chatSessions.delete(ws);
 
         // Auto-execute SQL from Claude's response, then resume session with results/errors

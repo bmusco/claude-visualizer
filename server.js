@@ -2225,6 +2225,8 @@ wss.on('connection', (ws, req) => {
             let lastQuerySql = null;
             let lastResultTable = null;
             let lastResultMeta = null;
+            let discoveryCount = 0;
+            const MAX_DISCOVERY = 3; // Max discovery queries before forcing a data query
 
             safeSend({ action: 'chat-status', text: 'Querying database...' });
 
@@ -2248,8 +2250,12 @@ wss.on('connection', (ws, req) => {
                 succeeded = true;
                 isDiscovery = /\bpg_tables\b|\binformation_schema\b|\bpg_columns\b|\bsvv_tables\b|\bsvv_columns\b|\bSHOW\s/i.test(currentSql);
                 if (isDiscovery) {
-                  safeSend({ action: 'chat-status', text: `Found ${result.rows.length} tables, writing query...` });
-                  feedbackMsg = `Discovery query returned ${result.rows.length} rows (${duration}ms):\n\n${table}\n\nNow use these table/column names to write the actual data query that answers the user's question: "${userMessage}". Output a new \`\`\`sql block.`;
+                  discoveryCount++;
+                  safeSend({ action: 'chat-status', text: `Discovered schema (${discoveryCount}/${MAX_DISCOVERY}), writing query...` });
+                  const forceData = discoveryCount >= MAX_DISCOVERY;
+                  feedbackMsg = `Discovery query returned ${result.rows.length} rows (${duration}ms):\n\n${table}\n\n${forceData
+                    ? `You have used all ${MAX_DISCOVERY} discovery queries. You MUST now write the actual data query using the tables and columns you have discovered. Do NOT run any more discovery queries. Output a \`\`\`sql block with a SELECT that answers: "${userMessage}"`
+                    : `Now use these table/column names to write the actual data query that answers the user's question: "${userMessage}". Output a new \`\`\`sql block.`}`;
                   succeeded = false;
                 } else {
                   lastQuerySql = currentSql;

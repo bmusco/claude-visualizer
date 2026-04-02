@@ -205,7 +205,7 @@ export PGPASSWORD=magic
 6. DO memorize query patterns, table names, column names, and join relationships you discover
 7. Check your memories for known table schemas and query patterns before writing SQL
 
-**Default database: prod_redshift**. Tables are in the `public` schema. Aurora tables (prod_clone) may not be available — if you get an error, rewrite using Redshift tables.
+**Default database: prod_redshift**. **ALWAYS use the `public` schema.** NEVER use `analytics` or any other schema unless the user explicitly asks for it. All discovery queries must use `schemaname='public'`. All table references should be unqualified (e.g. `my_table`) or use `public.my_table`. Aurora tables (prod_clone) may not be available — if you get an error, rewrite using Redshift tables.
 
 ### Jira (CTC Project)
 The main project is CTC (Commercial Telematics Cloud).

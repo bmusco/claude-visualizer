@@ -1941,9 +1941,7 @@ wss.on('connection', (ws, req) => {
         if (sqlBlocks.length > 0) {
           for (const sql of sqlBlocks) {
             try {
-              ws.send(JSON.stringify({ action: 'chat-status', text: 'Running query...' }));
               const start = Date.now();
-
               const cacheKey = sqlCacheKey(sql);
               const cached = queryCache.get(cacheKey);
               let rows, fields, duration;
@@ -1952,7 +1950,7 @@ wss.on('connection', (ws, req) => {
                 rows = cached.rows;
                 fields = cached.fields;
                 duration = cached.duration;
-                console.log(`[SQL-EXEC] Cache hit for query`);
+                console.log(`[SQL-EXEC] Cache hit`);
               } else {
                 console.log(`[SQL-EXEC] Executing: ${sql.slice(0, 100)}...`);
                 const result = await executeRedshiftQuery(sql);
@@ -1963,21 +1961,25 @@ wss.on('connection', (ws, req) => {
                 console.log(`[SQL-EXEC] Success: ${rows.length} rows, ${duration}ms`);
               }
 
-              ws.send(JSON.stringify({
-                action: 'query-result',
-                sql: sql.slice(0, 200),
-                fields,
-                rows: rows.slice(0, 1000),
-                rowCount: rows.length,
-                duration,
-              }));
+              // Format results as markdown table and stream as chat text
+              let resultText = `\n\n**Query results** (${rows.length} row${rows.length !== 1 ? 's' : ''}, ${duration}ms):\n\n`;
+              if (fields.length > 0 && rows.length > 0) {
+                resultText += '| ' + fields.join(' | ') + ' |\n';
+                resultText += '| ' + fields.map(() => '---').join(' | ') + ' |\n';
+                for (const row of rows.slice(0, 50)) {
+                  resultText += '| ' + fields.map(f => String(row[f] ?? '')).join(' | ') + ' |\n';
+                }
+                if (rows.length > 50) resultText += `\n*...and ${rows.length - 50} more rows*\n`;
+              } else {
+                resultText += '*No results*\n';
+              }
+              output += resultText;
+              ws.send(JSON.stringify({ action: 'chat-chunk', text: resultText }));
             } catch (err) {
               console.error(`[SQL-EXEC] Error: ${err.message}`);
-              ws.send(JSON.stringify({
-                action: 'query-error',
-                sql: sql.slice(0, 200),
-                error: err.message,
-              }));
+              const errText = `\n\n**Query error:** ${err.message}\n`;
+              output += errText;
+              ws.send(JSON.stringify({ action: 'chat-chunk', text: errText }));
             }
           }
         }

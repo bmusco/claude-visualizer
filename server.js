@@ -2136,7 +2136,7 @@ wss.on('connection', (ws, req) => {
             // Try executing, retry up to 3 times with Claude fixing the SQL
             let currentSql = sql;
             let succeeded = false;
-            const MAX_RETRIES = 3;
+            const MAX_RETRIES = 10;
             const errorHistory = [];
 
             for (let attempt = 0; attempt <= MAX_RETRIES && !succeeded; attempt++) {

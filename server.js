@@ -2120,7 +2120,7 @@ wss.on('connection', (ws, req) => {
         }
         if (sqlBlocks.length > 0) {
           for (const sql of sqlBlocks) {
-            const db = detectDatabase(sql);
+            let db = detectDatabase(sql);
             const cacheKey = sqlCacheKey(sql, db);
             const cached = queryCache.get(cacheKey);
 

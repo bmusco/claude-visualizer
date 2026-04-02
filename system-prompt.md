@@ -197,13 +197,14 @@ export PGPASSWORD=magic
 **IMPORTANT: Do NOT run psql commands or bash commands for database queries.** Write SQL in a ```sql code block. The system auto-executes it, shows results, and feeds errors back to you for fixing.
 
 ### Data Query Protocol
-1. Write SQL in a ```sql code block — the system executes it and feeds results/errors back to you
-2. If a query errors, the error is sent back to you — fix the SQL and output a new ```sql block
-3. If a table doesn't exist, discover available tables: `SELECT DISTINCT tablename FROM pg_tables WHERE schemaname='public' AND tablename LIKE '%keyword%'`
-4. After discovering tables, immediately write the ANSWER query — do not keep discovering
-5. Do NOT memorize query results — data changes constantly
-6. DO memorize query patterns, table names, column names, and join relationships you discover
-7. Check your memories for known table schemas and query patterns before writing SQL
+1. **SCHEMA RULE: ONLY use the `public` schema.** Never prefix tables with `analytics.` or any other schema. Write `SELECT ... FROM table_name`, not `SELECT ... FROM analytics.table_name`. Discovery queries must use `schemaname='public'`. The `analytics` schema does NOT exist in this environment.
+2. Write SQL in a ```sql code block — the system executes it and feeds results/errors back to you
+3. If a query errors, the error is sent back to you — fix the SQL and output a new ```sql block
+4. If a table doesn't exist, discover available tables: `SELECT DISTINCT tablename FROM pg_tables WHERE schemaname='public' AND tablename LIKE '%keyword%'`
+5. After discovering tables, immediately write the ANSWER query — do not keep discovering
+6. Do NOT memorize query results — data changes constantly
+7. DO memorize query patterns, table names, column names, and join relationships you discover
+8. Check your memories for known table schemas and query patterns before writing SQL
 
 **Default database: prod_redshift**. **ALWAYS use the `public` schema.** NEVER use `analytics` or any other schema unless the user explicitly asks for it. All discovery queries must use `schemaname='public'`. All table references should be unqualified (e.g. `my_table`) or use `public.my_table`. Aurora tables (prod_clone) may not be available — if you get an error, rewrite using Redshift tables.
 

@@ -2218,11 +2218,12 @@ wss.on('connection', (ws, req) => {
             let currentSql = sql;
 
             let lastQuerySql = null;
-            let lastResultText = null;
-            let finalSummary = null;
+            let lastResultTable = null;
+            let lastResultMeta = null;
 
             safeSend({ action: 'chat-status', text: 'Querying database...' });
 
+            // Phase 1: Execute queries silently until we have final results or exhaust retries
             for (let i = 0; i < MAX_ITERATIONS; i++) {
               let feedbackMsg;
               let succeeded = false;
@@ -2247,9 +2248,9 @@ wss.on('connection', (ws, req) => {
                   succeeded = false;
                 } else {
                   lastQuerySql = currentSql;
-                  lastResultText = `**Query results** (${result.rows.length} rows, ${duration}ms, ${db}):\n\n${table}`;
-                  safeSend({ action: 'chat-status', text: 'Summarizing results...' });
-                  feedbackMsg = `Query on ${db} returned ${result.rows.length} rows (${duration}ms):\n\n${table}\n\nSummarize these results to answer the user's question.`;
+                  lastResultTable = table;
+                  lastResultMeta = `${result.rows.length} rows, ${duration}ms, ${db}`;
+                  feedbackMsg = `Query on ${db} returned ${result.rows.length} rows (${duration}ms):\n\n${table}\n\nIf this data answers the user's question, summarize it. If not (e.g. 0 rows or wrong columns), write a corrected \`\`\`sql block.`;
                 }
               } catch (err) {
                 console.error(`[SQL-EXEC] Iter ${i} error: ${err.message}`);
@@ -2257,16 +2258,16 @@ wss.on('connection', (ws, req) => {
                   safeSend({ action: 'chat-chunk', text: `\n\n**Database error:** ${err.message}\n` });
                   break;
                 }
-                // Aurora queries are now silently redirected to Redshift in executeQuery
                 safeSend({ action: 'chat-status', text: `Query error, retrying...` });
                 feedbackMsg = `Query failed on ${db}.\nSQL: ${currentSql}\nError: ${err.message}\n\nFix the query and output a new \`\`\`sql block. The user asked: "${userMessage}"`;
               }
 
-              // Resume Claude session with feedback
+              // Resume Claude session with feedback (silent — no UI output)
               const sid = warmSessions.get(convId)?.sessionId;
               if (!sid || !feedbackMsg) { console.log(`[SQL-EXEC] No session (${sid}) or feedback — stopping`); break; }
 
               console.log(`[SQL-EXEC] Resuming session ${sid} with ${succeeded ? 'results' : isDiscovery ? 'discovery' : 'error'}...`);
+              if (succeeded && !isDiscovery) safeSend({ action: 'chat-status', text: 'Analyzing results...' });
 
               const resumeResult = await new Promise((resolve) => {
                 const args = ['-p', '--verbose', '--output-format', 'stream-json', '--include-partial-messages', '--permission-mode', 'bypassPermissions', '--resume', sid];
@@ -2278,13 +2279,7 @@ wss.on('connection', (ws, req) => {
                 proc.stdin.write(feedbackMsg);
                 proc.stdin.end();
 
-                let buf = '', text = '', newSql = null, isFinal = succeeded && !isDiscovery;
-                // Show final query + results just before Claude's summary streams in
-                if (isFinal && lastQuerySql && lastResultText) {
-                  const sqlDisplay = `\n\n\`\`\`sql\n${lastQuerySql}\n\`\`\`\n\n${lastResultText}\n\n`;
-                  safeSend({ action: 'chat-chunk', text: sqlDisplay });
-                  output += sqlDisplay;
-                }
+                let buf = '', text = '', newSql = null;
                 proc.stdout.on('data', (d) => {
                   buf += d.toString();
                   const lines = buf.split('\n'); buf = lines.pop();
@@ -2296,14 +2291,7 @@ wss.on('connection', (ws, req) => {
                       const et = ev?.type || p.type;
                       if (et === 'content_block_delta') {
                         const delta = ev.delta || {};
-                        if (delta.type === 'text_delta' && delta.text) {
-                          text += delta.text;
-                          // Only stream to UI on the final summarization pass
-                          if (isFinal) safeSend({ action: 'chat-chunk', text: delta.text });
-                        }
-                        else if (delta.type === 'thinking_delta' && delta.thinking) {
-                          if (isFinal) safeSend({ action: 'chat-thinking-delta', text: delta.thinking });
-                        }
+                        if (delta.type === 'text_delta' && delta.text) text += delta.text;
                       } else if (p.type === 'result' || et === 'result') {
                         const newSid = p.session_id || p.sessionId || ev?.session_id;
                         if (newSid) warmSessions.set(convId, { sessionId: newSid, lastUsed: Date.now() });
@@ -2313,7 +2301,6 @@ wss.on('connection', (ws, req) => {
                 });
                 proc.stderr.on('data', (d) => console.error(`[SQL-RESUME-STDERR] ${d.toString().trim()}`));
                 proc.on('close', (resumeCode) => {
-                  // Flush remaining buffer
                   if (buf.trim()) {
                     try {
                       const p = JSON.parse(buf);
@@ -2331,30 +2318,30 @@ wss.on('connection', (ws, req) => {
                     const cleaned = m[1].trim().replace(/^\s*--.*$/gm, '').trim();
                     if (/^\s*(SELECT|WITH)\b/i.test(cleaned)) newSql = m[1].trim();
                   }
-                  console.log(`[SQL-RESUME] code=${resumeCode}, textLen=${text.length}, hasSql=${!!newSql}, isFinal=${isFinal}, sid=${warmSessions.get(convId)?.sessionId || 'none'}`);
+                  console.log(`[SQL-RESUME] code=${resumeCode}, textLen=${text.length}, hasSql=${!!newSql}, sid=${warmSessions.get(convId)?.sessionId || 'none'}`);
                   resolve({ text, sql: newSql });
                 });
                 setTimeout(() => { try { proc.kill(); } catch {} }, 90000);
               });
-              output += resumeResult.text;
-              if (succeeded && !resumeResult.sql) finalSummary = resumeResult.text;
 
               if (resumeResult.sql) {
                 console.log(`[SQL-EXEC] Claude produced new SQL, continuing loop`);
                 currentSql = resumeResult.sql;
-              } else if (succeeded) {
-                console.log(`[SQL-EXEC] Claude summarized results — done`);
-                break;
               } else {
-                console.log(`[SQL-EXEC] Claude responded without new SQL — stopping`);
+                // Claude summarized or gave up — this is the final text
+                console.log(`[SQL-EXEC] Final response (succeeded=${succeeded}), displaying results`);
+
+                // Phase 2: Show final query + results + summary to UI
+                if (lastQuerySql && lastResultTable) {
+                  const sqlDisplay = `\n\n\`\`\`sql\n${lastQuerySql}\n\`\`\`\n\n**Query results** (${lastResultMeta}):\n\n${lastResultTable}\n\n`;
+                  safeSend({ action: 'chat-chunk', text: sqlDisplay });
+                  output += sqlDisplay;
+                }
+                // Stream the summary text
+                safeSend({ action: 'chat-chunk', text: resumeResult.text });
+                output += resumeResult.text;
                 break;
               }
-            }
-
-            // If no final summary was streamed (e.g. loop exhausted), show last results
-            if (lastQuerySql && lastResultText && !finalSummary) {
-              const sqlDisplay = `\n\n\`\`\`sql\n${lastQuerySql}\n\`\`\`\n\n${lastResultText}`;
-              safeSend({ action: 'chat-chunk', text: sqlDisplay });
             }
           }
         }

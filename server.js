@@ -2201,7 +2201,10 @@ wss.on('connection', (ws, req) => {
       claude.on('close', async (code) => {
         console.log(`[CHAT] Claude process closed with code ${code}, output length: ${output.length}, has sql: ${/\`\`\`sql/.test(output)}`);
         chatSessions.delete(ws);
-        const safeSend = (data) => { try { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data)); } catch {} };
+        const safeSend = (data) => {
+          if (ws.readyState !== WebSocket.OPEN) { console.log(`[WS] Cannot send — ws state: ${ws.readyState}`); return; }
+          try { ws.send(JSON.stringify(data)); } catch (e) { console.error(`[WS] Send error: ${e.message}`); }
+        };
 
         // Auto-execute SQL from Claude's response, then resume session with results/errors
         const sqlBlockRegex = /```sql\n([\s\S]*?)```/g;
@@ -2238,6 +2241,7 @@ wss.on('connection', (ws, req) => {
               try {
                 const start = Date.now();
                 console.log(`[SQL-EXEC] Iter ${i} on ${db}: ${currentSql.slice(0, 100)}...`);
+                safeSend({ action: 'chat-status', text: `Running query (${i + 1})...` });
                 const result = await executeQuery(currentSql, db);
                 const duration = Date.now() - start;
                 console.log(`[SQL-EXEC] Success: ${result.rows.length} rows, ${duration}ms`);
@@ -2343,14 +2347,17 @@ wss.on('connection', (ws, req) => {
                 console.log(`[SQL-EXEC] Final response (succeeded=${succeeded}), displaying results`);
 
                 // Phase 2: Show final query + results + summary to UI
+                console.log(`[SQL-EXEC] Displaying: lastQuery=${!!lastQuerySql}, lastTable=${!!lastResultTable}, summaryLen=${resumeResult.text.length}, wsState=${ws.readyState}`);
                 if (lastQuerySql && lastResultTable) {
                   const sqlDisplay = `\n\n\`\`\`sql\n${lastQuerySql}\n\`\`\`\n\n**Query results** (${lastResultMeta}):\n\n${lastResultTable}\n\n`;
                   safeSend({ action: 'chat-chunk', text: sqlDisplay });
                   output += sqlDisplay;
                 }
                 // Stream the summary text
-                safeSend({ action: 'chat-chunk', text: resumeResult.text });
-                output += resumeResult.text;
+                if (resumeResult.text) {
+                  safeSend({ action: 'chat-chunk', text: resumeResult.text });
+                  output += resumeResult.text;
+                }
                 break;
               }
             }

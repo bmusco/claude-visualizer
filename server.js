@@ -1139,15 +1139,18 @@ function fetchDriveFilesAsync(query) {
   return promise;
 }
 
-// Initialize direct MCP on server start
+// Initialize direct MCP on server start (disabled in deployed mode — can't reach portal)
 setTimeout(async () => {
-  if (loadMcpTokensFromKeychain()) {
-    directMcpAvailable = true;
-    console.log('[MCP] Direct Google Workspace token loaded (fast mode ~1s vs ~15s)');
+  if (process.env.NODE_ENV !== 'production') {
+    if (loadMcpTokensFromKeychain()) {
+      directMcpAvailable = true;
+      console.log('[MCP] Direct Google Workspace token loaded (fast mode ~1s vs ~15s)');
+    }
+    fetchDriveFilesAsync('');
+    setTimeout(() => fetchDriveFilesAsync('mimeType:application/vnd.google-apps.presentation'), 3000);
+  } else {
+    console.log('[MCP] Skipping MCP pre-fetch in production (using direct Google/Slack APIs)');
   }
-  // Pre-fetch recent files
-  fetchDriveFilesAsync('');
-  setTimeout(() => fetchDriveFilesAsync('mimeType:application/vnd.google-apps.presentation'), 3000);
 }, 500);
 
 // Fast server-side fuzzy filter across ALL cached Drive files

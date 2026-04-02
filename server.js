@@ -2206,7 +2206,9 @@ wss.on('connection', (ws, req) => {
         const sqlBlocks = [];
         while ((sqlMatch = sqlBlockRegex.exec(output)) !== null) {
           const sql = sqlMatch[1].trim();
-          if (/^\s*(SELECT|WITH)\b/i.test(sql)) sqlBlocks.push(sql);
+          // Strip SQL comments before checking — Claude often prefixes with "-- database: ..."
+          const sqlNoComments = sql.replace(/^\s*--.*$/gm, '').trim();
+          if (/^\s*(SELECT|WITH)\b/i.test(sqlNoComments)) sqlBlocks.push(sql);
         }
 
         if (sqlBlocks.length > 0 && convId) {
@@ -2290,7 +2292,10 @@ wss.on('connection', (ws, req) => {
                 proc.stderr.on('data', (d) => console.error(`[SQL-RESUME-STDERR] ${d.toString().trim()}`));
                 proc.on('close', () => {
                   const m = text.match(/```sql\n([\s\S]*?)```/);
-                  if (m && /^\s*(SELECT|WITH)\b/i.test(m[1].trim())) newSql = m[1].trim();
+                  if (m) {
+                    const cleaned = m[1].trim().replace(/^\s*--.*$/gm, '').trim();
+                    if (/^\s*(SELECT|WITH)\b/i.test(cleaned)) newSql = m[1].trim();
+                  }
                   resolve({ text, sql: newSql });
                 });
                 setTimeout(() => { try { proc.kill(); } catch {} }, 90000);

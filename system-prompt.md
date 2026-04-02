@@ -241,6 +241,7 @@ Key tables in the prod aurora database:
 5. DO memorize query patterns, table names, column names, and join relationships you discover
 6. If a query fails with "column does not exist", remember which columns actually exist for next time
 7. Start simple (SELECT COUNT(*) or SELECT * LIMIT 5) to verify tables/columns before complex queries
+8. **If a query errors, fix it and try again.** Read the error message, adjust the SQL (fix column names, table names, joins), and output a new ```sql block. Keep trying until it works or you've exhausted reasonable approaches. Common fixes: check column names with `SELECT * FROM table LIMIT 1`, try alternate column names, remove problematic joins.
 
 **Current database: cmt-alpha (dev).** Tables and schema match production but data is smaller.
 

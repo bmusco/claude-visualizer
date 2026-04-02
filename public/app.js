@@ -3627,6 +3627,8 @@ function handleChatMessage(data) {
       });
     }
   } else if (data.action === 'query-result') {
+    removeStatus();
+    removeTypingIndicator();
     const tableHtml = renderQueryTable(data.fields, data.rows, data.rowCount, data.duration, data.sql);
     const messages = document.getElementById('chat-messages');
     const msg = document.createElement('div');
@@ -3642,6 +3644,8 @@ function handleChatMessage(data) {
     messages.appendChild(msg);
     messages.scrollTop = messages.scrollHeight;
   } else if (data.action === 'query-error') {
+    removeStatus();
+    removeTypingIndicator();
     addChatMessage('assistant', `**Query error:** ${escapeHtml(data.error)}\n\n\`\`\`sql\n${escapeHtml(data.sql)}...\n\`\`\``, true);
   } else if (data.action === 'chat-error') {
     removeStatus();

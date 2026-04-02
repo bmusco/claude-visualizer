@@ -235,43 +235,54 @@ Key tables in the prod aurora database:
 ### Data Query Protocol
 **Database query rules:**
 1. Check the Known Query Patterns below FIRST — use them directly, don't reinvent joins
-2. **ALWAYS run queries with:** `node /app/scripts/query.js "YOUR SQL HERE"` — this is the ONLY way to query the database. Do NOT write SQL in code blocks. Do NOT use psql. ONLY use this command.
-3. If a query errors, read the error, fix the SQL, and run `node /app/scripts/query.js` again with the corrected query
-4. If a column doesn't exist, run `node /app/scripts/query.js "SELECT * FROM tablename LIMIT 1"` to discover correct columns, then re-run your original query with fixed column names
-5. Keep iterating until you get the actual answer the user asked for
-6. Do NOT memorize query results — data changes constantly
-7. DO memorize query patterns, table names, column names, and join relationships you discover
+2. Write SQL in a ```sql code block — the system auto-executes it and displays results as tables
+3. If a query errors, fix the SQL and try again — the system retries up to 3 times automatically, feeding error context back to you
+4. Start simple (`SELECT * FROM tablename LIMIT 5`) to discover column names before complex queries
+5. Do NOT memorize query results — data changes constantly
+6. DO memorize query patterns, table names, column names, and join relationships you discover
 
-**Current database: cmt-alpha (dev).** Tables and schema match production but data is smaller.
+**Default database: prod_redshift** (production Redshift analytics cluster). The system auto-routes queries to **prod_clone** (Aurora) when it detects Aurora-specific tables like `companies`, `fleets_fleet`, `teams_team`, `app_users`, `companies_apps`, `portal_company_config`, `vehicles_v2`. You can also specify a database explicitly by mentioning it (e.g., "query prod_clone").
 
 **Known Query Patterns:**
 
-Find company:
+**Aurora tables** (auto-routed to prod_clone): companies, fleets_fleet, teams_team, app_users, companies_apps, portal_company_config, vehicles_v2
+**Redshift tables** (default prod_redshift): triplog_trips, app_user_fleet_scores_history, tag_status_latest, and most analytics tables
+
+Find company (Aurora):
 ```sql
 SELECT companyid, name, public_name FROM companies WHERE name ILIKE '%search%';
 ```
 
-Find fleets for company:
+Find fleets for company (Aurora):
 ```sql
-SELECT id, name FROM fleets_fleet WHERE viewing_company_id = <companyid>;
+SELECT f.id, f.name, f.reporting_name, f.deleted, f.is_fleet_type
+FROM fleets_fleet f
+WHERE f.viewing_company_id = <companyid>;
 ```
 
-Find teams:
+Count active fleets for company (Aurora):
+```sql
+SELECT COUNT(*) as fleet_count
+FROM fleets_fleet
+WHERE viewing_company_id = <companyid> AND deleted = false;
+```
+
+Find teams (Aurora):
 ```sql
 SELECT id, name FROM teams_team WHERE viewing_company_id = <companyid>;
 ```
 
-Miles by fleet (triplog):
+Miles by fleet (Redshift — triplog):
 ```sql
 SELECT f.id, f.name, COUNT(*) as trips, ROUND(SUM(t.mileage_est_km) * 0.621371, 0) as total_miles
 FROM triplog_trips t
-JOIN fleets_fleet f ON f.id = t.viewing_company_id
-WHERE t.viewing_company_id IN (<fleet_ids>)
+JOIN fleets_fleet f ON f.id = t.fleet_id
+WHERE t.fleet_id IN (<fleet_ids>)
 GROUP BY f.id, f.name
 ORDER BY total_miles DESC;
 ```
 
-Fleet scores:
+Fleet scores (Redshift):
 ```sql
 SELECT f.name, s.* FROM app_user_fleet_scores_history s
 JOIN fleets_fleet f ON f.id = s.fleet_id

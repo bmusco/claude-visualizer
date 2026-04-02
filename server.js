@@ -861,58 +861,66 @@ app.post('/api/config/reauth/:server', (req, res) => {
   res.json({ ok: result.status === 0, output: output.slice(0, 300) });
 });
 
-// ── Redshift Data API — no VPC tunneling needed ──────────────────
-const { RedshiftDataClient, ExecuteStatementCommand, DescribeStatementCommand, GetStatementResultCommand } = require('@aws-sdk/client-redshift-data');
-const redshiftData = new RedshiftDataClient({ region: process.env.REDSHIFT_REGION || 'us-east-1' });
+// ── Database queries via pgproxy sidecar (supports Redshift + Aurora) ──
+const { Pool } = require('pg');
 
-const REDSHIFT_CLUSTER = process.env.REDSHIFT_CLUSTER || 'cmt-cmt-alpha-analytics';
-const REDSHIFT_DATABASE = process.env.REDSHIFT_DATABASE || 'cmt_alpha_vtrack';
-const REDSHIFT_DB_USER = process.env.REDSHIFT_DB_USER || 'bmusco@cmtelematics.com';
+const PGPROXY_HOST = process.env.PGPROXY_HOST || '127.0.0.1';
+const PGPROXY_PORT = parseInt(process.env.PGPROXY_PORT || '13626');
+const PGPROXY_USER = process.env.PGPROXY_USER || 'bmusco@cmtelematics.com';
+const PGPROXY_PASSWORD = process.env.PGPROXY_PASSWORD || 'magic';
+const DEFAULT_DATABASE = process.env.DEFAULT_DATABASE || 'prod_redshift';
+
+// Pool cache: one pool per database name
+const pgPools = new Map();
+function getPool(database) {
+  const db = database || DEFAULT_DATABASE;
+  if (!pgPools.has(db)) {
+    pgPools.set(db, new Pool({
+      host: PGPROXY_HOST,
+      port: PGPROXY_PORT,
+      user: PGPROXY_USER,
+      password: PGPROXY_PASSWORD,
+      database: db,
+      ssl: false,
+      max: 5,
+      idleTimeoutMillis: 60000,
+      connectionTimeoutMillis: 30000,
+    }));
+  }
+  return pgPools.get(db);
+}
 
 const queryCache = new Map();
 const QUERY_CACHE_TTL = 5 * 60 * 1000;
 
-function sqlCacheKey(sql) {
-  return crypto.createHash('md5').update(sql.trim()).digest('hex');
+function sqlCacheKey(sql, database) {
+  return crypto.createHash('md5').update((database || DEFAULT_DATABASE) + ':' + sql.trim()).digest('hex');
 }
 
-async function executeRedshiftQuery(sql) {
-  const execResp = await redshiftData.send(new ExecuteStatementCommand({
-    ClusterIdentifier: REDSHIFT_CLUSTER,
-    Database: REDSHIFT_DATABASE,
-    DbUser: REDSHIFT_DB_USER,
-    Sql: sql,
-  }));
-
-  const stmtId = execResp.Id;
-  let status = 'SUBMITTED';
-  let attempts = 0;
-
-  while (status !== 'FINISHED' && status !== 'FAILED' && status !== 'ABORTED' && attempts < 60) {
-    await new Promise(r => setTimeout(r, attempts < 5 ? 500 : 2000));
-    const desc = await redshiftData.send(new DescribeStatementCommand({ Id: stmtId }));
-    status = desc.Status;
-    if (status === 'FAILED') throw new Error(desc.Error || 'Query failed');
-    if (status === 'ABORTED') throw new Error('Query aborted');
-    attempts++;
+// Detect which database a query needs based on table names
+function detectDatabase(sql) {
+  const lower = sql.toLowerCase();
+  // Aurora clone tables (companies, fleets_fleet, teams_team, app_users, etc.)
+  const auroraTables = ['companies', 'fleets_fleet', 'companies_apps', 'teams_team', 'app_users',
+    'portal_company_config', 'fleets_nextgentagfleetinfo', 'fleet_scheduled_messages',
+    'byod_fleet_', 'geofences_'];
+  for (const t of auroraTables) {
+    if (lower.includes(t)) return 'prod_clone';
   }
+  return DEFAULT_DATABASE;
+}
 
-  if (status !== 'FINISHED') throw new Error('Query timeout');
-
-  const result = await redshiftData.send(new GetStatementResultCommand({ Id: stmtId }));
-  const fields = (result.ColumnMetadata || []).map(c => c.name);
-  const rows = (result.Records || []).map(row =>
-    Object.fromEntries(row.map((cell, i) => {
-      const val = cell.stringValue ?? cell.longValue ?? cell.doubleValue ?? cell.booleanValue ?? null;
-      return [fields[i], val];
-    }))
-  );
-
-  return { fields, rows };
+async function executeQuery(sql, database) {
+  const db = database || detectDatabase(sql);
+  const pool = getPool(db);
+  const result = await pool.query(sql);
+  const fields = (result.fields || []).map(f => f.name);
+  const rows = result.rows || [];
+  return { fields, rows, database: db };
 }
 
 app.post('/api/query', express.json(), async (req, res) => {
-  const { sql } = req.body;
+  const { sql, database } = req.body;
   if (!sql) return res.status(400).json({ ok: false, error: 'Missing sql parameter' });
 
   const upper = sql.trim().toUpperCase();
@@ -920,21 +928,22 @@ app.post('/api/query', express.json(), async (req, res) => {
     return res.status(403).json({ ok: false, error: 'Only SELECT queries are allowed' });
   }
 
-  const cacheKey = sqlCacheKey(sql);
+  const db = database || detectDatabase(sql);
+  const cacheKey = sqlCacheKey(sql, db);
   const cached = queryCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < QUERY_CACHE_TTL) {
-    return res.json({ ok: true, rows: cached.rows, fields: cached.fields, cached: true, duration: cached.duration });
+    return res.json({ ok: true, rows: cached.rows, fields: cached.fields, cached: true, duration: cached.duration, database: db });
   }
 
   const start = Date.now();
   try {
-    const { fields, rows } = await executeRedshiftQuery(sql);
+    const { fields, rows } = await executeQuery(sql, db);
     const duration = Date.now() - start;
     queryCache.set(cacheKey, { rows, fields, ts: Date.now(), duration });
-    res.json({ ok: true, rows, fields, rowCount: rows.length, duration });
+    res.json({ ok: true, rows, fields, rowCount: rows.length, duration, database: db });
   } catch (err) {
-    console.error('[REDSHIFT]', err.message);
-    res.json({ ok: false, error: err.message, duration: Date.now() - start });
+    console.error('[QUERY]', err.message);
+    res.json({ ok: false, error: err.message, duration: Date.now() - start, database: db });
   }
 });
 
@@ -1925,7 +1934,7 @@ wss.on('connection', (ws, req) => {
       claude.on('close', async (code) => {
         chatSessions.delete(ws);
 
-        // Fallback: auto-execute SQL code blocks if Claude writes them instead of using query.js
+        // Auto-execute SQL code blocks and retry up to 3 times on failure
         const sqlBlockRegex = /```sql\n([\s\S]*?)```/g;
         let sqlMatch;
         const sqlBlocks = [];
@@ -1937,88 +1946,90 @@ wss.on('connection', (ws, req) => {
         }
         if (sqlBlocks.length > 0) {
           for (const sql of sqlBlocks) {
-            try {
-              const start = Date.now();
-              const cacheKey = sqlCacheKey(sql);
-              const cached = queryCache.get(cacheKey);
-              let rows, fields, duration;
+            const db = detectDatabase(sql);
+            const cacheKey = sqlCacheKey(sql, db);
+            const cached = queryCache.get(cacheKey);
 
-              if (cached && Date.now() - cached.ts < QUERY_CACHE_TTL) {
-                rows = cached.rows;
-                fields = cached.fields;
-                duration = cached.duration;
-                console.log(`[SQL-EXEC] Cache hit`);
-              } else {
-                console.log(`[SQL-EXEC] Executing: ${sql.slice(0, 100)}...`);
-                const result = await executeRedshiftQuery(sql);
-                duration = Date.now() - start;
-                fields = result.fields;
-                rows = result.rows;
-                queryCache.set(cacheKey, { rows, fields, ts: Date.now(), duration });
-                console.log(`[SQL-EXEC] Success: ${rows.length} rows, ${duration}ms`);
-              }
-
-              // Format results as markdown table and stream as chat text
-              let resultText = `\n\n**Query results** (${rows.length} row${rows.length !== 1 ? 's' : ''}, ${duration}ms):\n\n`;
-              if (fields.length > 0 && rows.length > 0) {
-                resultText += '| ' + fields.join(' | ') + ' |\n';
-                resultText += '| ' + fields.map(() => '---').join(' | ') + ' |\n';
-                for (const row of rows.slice(0, 50)) {
-                  resultText += '| ' + fields.map(f => String(row[f] ?? '')).join(' | ') + ' |\n';
-                }
-                if (rows.length > 50) resultText += `\n*...and ${rows.length - 50} more rows*\n`;
-              } else {
-                resultText += '*No results*\n';
-              }
+            if (cached && Date.now() - cached.ts < QUERY_CACHE_TTL) {
+              const { rows, fields, duration } = cached;
+              console.log(`[SQL-EXEC] Cache hit`);
+              const resultText = formatQueryResult(fields, rows, duration);
               output += resultText;
               ws.send(JSON.stringify({ action: 'chat-chunk', text: resultText }));
-            } catch (err) {
-              console.error(`[SQL-EXEC] Error: ${err.message}`);
-              const errText = `\n\n**Query error:** ${err.message}\n`;
-              output += errText;
-              ws.send(JSON.stringify({ action: 'chat-chunk', text: errText }));
+              continue;
+            }
 
-              // Auto-retry: feed error back to Claude for a fix
-              if (!sql._retried) {
-                console.log(`[SQL-EXEC] Retrying with error context...`);
-                ws.send(JSON.stringify({ action: 'chat-chunk', text: '\n\nRetrying with corrected query...\n' }));
-                const retryPrompt = `You are a SQL assistant. A query failed. Output ONLY a corrected SQL query inside a \`\`\`sql code block. No explanation, no prose — just the fixed SQL.\n\nError: ${err.message}\n\nFailed query:\n\`\`\`sql\n${sql}\n\`\`\`\n\nIf a column doesn't exist, first output:\n\`\`\`sql\nSELECT * FROM ${sql.match(/FROM\s+(\w+)/i)?.[1] || 'the_table'} LIMIT 1\n\`\`\`\nto discover correct column names. Then output the fixed query.`;
-                const retryResult = spawnSync(CLAUDE_CLI, ['-p', '--output-format', 'text', '--max-turns', '1', retryPrompt], {
-                  encoding: 'utf-8',
-                  timeout: 30000,
-                  env: { ...process.env, HOME: USER_HOME },
-                  cwd: USER_HOME
-                });
-                const retryOutput = (retryResult.stdout || '').trim();
-                if (retryOutput) {
-                  ws.send(JSON.stringify({ action: 'chat-chunk', text: '\n' + retryOutput }));
-                  output += '\n' + retryOutput;
+            // Try executing, retry up to 3 times with Claude fixing the SQL
+            let currentSql = sql;
+            let succeeded = false;
+            const MAX_RETRIES = 3;
+            const errorHistory = [];
+
+            for (let attempt = 0; attempt <= MAX_RETRIES && !succeeded; attempt++) {
+              try {
+                const start = Date.now();
+                console.log(`[SQL-EXEC] ${attempt > 0 ? `Retry ${attempt}` : 'Executing'} on ${db}: ${currentSql.slice(0, 120)}...`);
+                const result = await executeQuery(currentSql, db);
+                const duration = Date.now() - start;
+                queryCache.set(sqlCacheKey(currentSql, db), { rows: result.rows, fields: result.fields, ts: Date.now(), duration });
+                console.log(`[SQL-EXEC] Success: ${result.rows.length} rows, ${duration}ms`);
+
+                const label = attempt > 0 ? 'Corrected query results' : 'Query results';
+                const resultText = `\n\n**${label}** (${result.rows.length} row${result.rows.length !== 1 ? 's' : ''}, ${duration}ms, ${db}):\n\n` +
+                  formatMarkdownTable(result.fields, result.rows);
+                output += resultText;
+                ws.send(JSON.stringify({ action: 'chat-chunk', text: resultText }));
+                succeeded = true;
+              } catch (err) {
+                console.error(`[SQL-EXEC] Attempt ${attempt} error: ${err.message}`);
+                errorHistory.push({ sql: currentSql, error: err.message });
+
+                if (attempt < MAX_RETRIES) {
+                  ws.send(JSON.stringify({ action: 'chat-chunk', text: `\n\n**Query error:** ${err.message}\nRetrying (${attempt + 1}/${MAX_RETRIES})...\n` }));
+
+                  const retryPrompt = `You are a SQL expert for CMT databases. Fix this query. Output ONLY a corrected \`\`\`sql code block — no explanation.
+
+Database: ${db} (${db.includes('clone') ? 'Aurora/Postgres' : 'Redshift'})
+${db.includes('clone') ? 'Key tables: companies (companyid, name), fleets_fleet (id, name, viewing_company_id, app_id, deleted), companies_apps (id, company_id), teams_team (id, name, fleet_id, viewing_company_id)' : 'Schema: analytics.*'}
+
+${errorHistory.map((e, i) => `Attempt ${i + 1}:\nSQL: ${e.sql}\nError: ${e.error}`).join('\n\n')}
+
+Fix the latest error. If a table/column doesn't exist, try discovering it with: SELECT * FROM <table> LIMIT 1`;
+
+                  const retryResult = spawnSync(CLAUDE_CLI, ['-p', '--output-format', 'text', '--max-turns', '1', retryPrompt], {
+                    encoding: 'utf-8',
+                    timeout: 30000,
+                    env: { ...process.env, HOME: USER_HOME },
+                    cwd: USER_HOME
+                  });
+                  const retryOutput = (retryResult.stdout || '').trim();
                   const retryMatch = retryOutput.match(/```sql\n([\s\S]*?)```/);
-                  if (retryMatch) {
-                    const retrySql = retryMatch[1].trim();
-                    if (/^\s*(SELECT|WITH)\b/i.test(retrySql)) {
-                      try {
-                        const retryRes = await executeRedshiftQuery(retrySql);
-                        let retryText = `\n\n**Corrected query results** (${retryRes.rows.length} rows):\n\n`;
-                        if (retryRes.fields.length > 0 && retryRes.rows.length > 0) {
-                          retryText += '| ' + retryRes.fields.join(' | ') + ' |\n';
-                          retryText += '| ' + retryRes.fields.map(() => '---').join(' | ') + ' |\n';
-                          for (const row of retryRes.rows.slice(0, 50)) {
-                            retryText += '| ' + retryRes.fields.map(f => String(row[f] ?? '')).join(' | ') + ' |\n';
-                          }
-                        }
-                        output += retryText;
-                        ws.send(JSON.stringify({ action: 'chat-chunk', text: retryText }));
-                        queryCache.set(sqlCacheKey(retrySql), { rows: retryRes.rows, fields: retryRes.fields, ts: Date.now(), duration: 0 });
-                      } catch (retryErr) {
-                        ws.send(JSON.stringify({ action: 'chat-chunk', text: `\n**Retry also failed:** ${retryErr.message}\n` }));
-                      }
-                    }
+                  if (retryMatch && /^\s*(SELECT|WITH)\b/i.test(retryMatch[1].trim())) {
+                    currentSql = retryMatch[1].trim();
+                  } else {
+                    // Claude didn't produce valid SQL, stop retrying
+                    ws.send(JSON.stringify({ action: 'chat-chunk', text: `\n**Could not auto-fix query after ${attempt + 1} attempts.**\n` }));
+                    break;
                   }
+                } else {
+                  const errText = `\n\n**Query failed after ${MAX_RETRIES} retries:** ${err.message}\n`;
+                  output += errText;
+                  ws.send(JSON.stringify({ action: 'chat-chunk', text: errText }));
                 }
               }
             }
           }
+        }
+
+        function formatMarkdownTable(fields, rows) {
+          if (!fields.length || !rows.length) return '*No results*\n';
+          let t = '| ' + fields.join(' | ') + ' |\n';
+          t += '| ' + fields.map(() => '---').join(' | ') + ' |\n';
+          for (const row of rows.slice(0, 50)) {
+            t += '| ' + fields.map(f => String(row[f] ?? '')).join(' | ') + ' |\n';
+          }
+          if (rows.length > 50) t += `\n*...and ${rows.length - 50} more rows*\n`;
+          return t;
         }
 
         // Save assistant response to history

@@ -235,10 +235,10 @@ Key tables in the prod aurora database:
 ### Data Query Protocol
 **Database query rules:**
 1. Check the Known Query Patterns below FIRST — use them directly, don't reinvent joins
-2. **Preferred:** Run queries with bash: `node /app/scripts/query.js "SELECT ..."` — you see output directly and can retry if it errors
-3. **Alternative:** Write SQL in a ```sql code block — the system auto-executes it and shows results
-4. If a query errors, fix the SQL and try again — keep iterating until it works
-5. Start simple (`node /app/scripts/query.js "SELECT * FROM tablename LIMIT 5"`) to discover column names before complex queries
+2. **ALWAYS run queries with:** `node /app/scripts/query.js "YOUR SQL HERE"` — this is the ONLY way to query the database. Do NOT write SQL in code blocks. Do NOT use psql. ONLY use this command.
+3. If a query errors, read the error, fix the SQL, and run `node /app/scripts/query.js` again with the corrected query
+4. If a column doesn't exist, run `node /app/scripts/query.js "SELECT * FROM tablename LIMIT 1"` to discover correct columns, then re-run your original query with fixed column names
+5. Keep iterating until you get the actual answer the user asked for
 6. Do NOT memorize query results — data changes constantly
 7. DO memorize query patterns, table names, column names, and join relationships you discover
 

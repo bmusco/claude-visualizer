@@ -2265,7 +2265,7 @@ wss.on('connection', (ws, req) => {
               safeSend({ action: 'chat-status', text: succeeded ? 'Summarizing results...' : 'Writing query...' });
 
               const resumeResult = await new Promise((resolve) => {
-                const args = ['-p', '--verbose', '--output-format', 'stream-json', '--permission-mode', 'bypassPermissions', '--resume', sid];
+                const args = ['-p', '--verbose', '--output-format', 'stream-json', '--include-partial-messages', '--permission-mode', 'bypassPermissions', '--resume', sid];
                 const proc = spawn(CLAUDE_CLI, args, {
                   env: { ...process.env, HOME: USER_HOME, CLAUDEIO_SESSION: '1' },
                   cwd: __dirname,
@@ -2297,12 +2297,26 @@ wss.on('connection', (ws, req) => {
                   }
                 });
                 proc.stderr.on('data', (d) => console.error(`[SQL-RESUME-STDERR] ${d.toString().trim()}`));
-                proc.on('close', () => {
+                proc.on('close', (resumeCode) => {
+                  // Flush remaining buffer
+                  if (buf.trim()) {
+                    try {
+                      const p = JSON.parse(buf);
+                      const ev = p.type === 'stream_event' ? p.event : p;
+                      if (p.type === 'result' || (ev?.type || p.type) === 'result') {
+                        const newSid = p.session_id || p.sessionId || ev?.session_id;
+                        if (newSid) warmSessions.set(convId, { sessionId: newSid, lastUsed: Date.now() });
+                      }
+                      const delta = ev?.delta || {};
+                      if (delta.type === 'text_delta' && delta.text) text += delta.text;
+                    } catch {}
+                  }
                   const m = text.match(/```sql\n([\s\S]*?)```/);
                   if (m) {
                     const cleaned = m[1].trim().replace(/^\s*--.*$/gm, '').trim();
                     if (/^\s*(SELECT|WITH)\b/i.test(cleaned)) newSql = m[1].trim();
                   }
+                  console.log(`[SQL-RESUME] code=${resumeCode}, textLen=${text.length}, hasSql=${!!newSql}, sid=${warmSessions.get(convId)?.sessionId || 'none'}`);
                   resolve({ text, sql: newSql });
                 });
                 setTimeout(() => { try { proc.kill(); } catch {} }, 90000);

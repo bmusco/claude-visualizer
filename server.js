@@ -2148,12 +2148,22 @@ wss.on('connection', (ws, req) => {
                 queryCache.set(sqlCacheKey(currentSql, db), { rows: result.rows, fields: result.fields, ts: Date.now(), duration });
                 console.log(`[SQL-EXEC] Success: ${result.rows.length} rows, ${duration}ms`);
 
-                const label = attempt > 0 ? 'Corrected query results' : 'Query results';
-                const resultText = `\n\n**${label}** (${result.rows.length} row${result.rows.length !== 1 ? 's' : ''}, ${duration}ms, ${db}):\n\n` +
-                  formatMarkdownTable(result.fields, result.rows);
-                output += resultText;
-                ws.send(JSON.stringify({ action: 'chat-chunk', text: resultText }));
-                succeeded = true;
+                // Check if this is a schema discovery query (not the actual answer)
+                const isDiscoveryQuery = /information_schema|pg_tables|pg_catalog|LIMIT\s+50\b/i.test(currentSql) && attempt > 0;
+                if (isDiscoveryQuery && attempt < MAX_RETRIES) {
+                  // Feed discovery results into next retry so Claude can write the real query
+                  const tableList = result.rows.slice(0, 30).map(r => Object.values(r).join('.')).join(', ');
+                  errorHistory.push({ sql: currentSql, error: `DISCOVERY_RESULT: Found tables: ${tableList}. Now write a query using these tables to answer the user's question.` });
+                  ws.send(JSON.stringify({ action: 'chat-chunk', text: `\n\n**Discovering available tables...** (${result.rows.length} found, ${duration}ms)\n` }));
+                  // Don't mark as succeeded — continue to next attempt
+                } else {
+                  const label = attempt > 0 ? 'Corrected query results' : 'Query results';
+                  const resultText = `\n\n**${label}** (${result.rows.length} row${result.rows.length !== 1 ? 's' : ''}, ${duration}ms, ${db}):\n\n` +
+                    formatMarkdownTable(result.fields, result.rows);
+                  output += resultText;
+                  ws.send(JSON.stringify({ action: 'chat-chunk', text: resultText }));
+                  succeeded = true;
+                }
               } catch (err) {
                 console.error(`[SQL-EXEC] Attempt ${attempt} error: ${err.message}`);
 
@@ -2179,21 +2189,25 @@ wss.on('connection', (ws, req) => {
 
                   let retryPrompt;
                   if (isAuroraUnavailable) {
-                    retryPrompt = `You are a SQL expert for CMT databases. The Aurora database (prod_clone) is NOT available in this environment. You MUST rewrite this query to use ONLY Redshift analytics tables.
+                    retryPrompt = `You are a SQL expert for CMT databases. The user asked: "${userMessage}"
 
-Original query that failed (uses Aurora tables like fleets_fleet, companies, vehicles_v2, etc.):
+The Aurora database (prod_clone) is NOT available. The original query used Aurora tables:
 ${currentSql}
 
-IMPORTANT: Aurora tables (fleets_fleet, companies, companies_apps, teams_team, app_users, vehicles_v2, portal_company_config) are NOT accessible. You must find the data using Redshift analytics tables only.
+You MUST rewrite this to answer the user's question using ONLY Redshift analytics tables (prod_redshift).
 
-Known Redshift tables and patterns:
-- triplog_trips: trip data with fleet_id, mileage_est_km, etc.
-- app_user_fleet_scores_history: fleet scores with fleet_id
-- tag_status_latest: device/tag status
-- For fleet info, you may need to query: SELECT * FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') LIMIT 50
-- Try discovering available tables first if needed
+Aurora tables NOT available: fleets_fleet, companies, companies_apps, teams_team, app_users, vehicles_v2, portal_company_config
 
-Output ONLY a corrected \`\`\`sql code block — no explanation. If the data truly cannot be found in Redshift, output a query that discovers what tables ARE available.`;
+Known Redshift tables:
+- analytics.triplog_trips: fleet_id, user_id, mileage_est_km, start_time, etc.
+- analytics.app_user_fleet_scores_history: fleet_id, score, created_at
+- analytics.tag_status_latest: device/tag data with fleet_id
+- analytics.vehicles_trip_summary: vehicle trip aggregates
+- Try: SELECT DISTINCT tablename FROM pg_tables WHERE schemaname='analytics' AND tablename LIKE '%vehicle%' to discover tables
+
+${errorHistory.length > 1 ? errorHistory.map((e, i) => `Attempt ${i + 1}:\nSQL: ${e.sql}\nError: ${e.error}`).join('\n\n') : ''}
+
+Output ONLY a \`\`\`sql code block that answers the user's question. Do NOT just list tables — write a query that gets the actual answer.`;
                   } else {
                     retryPrompt = `You are a SQL expert for CMT databases. Fix this query. Output ONLY a corrected \`\`\`sql code block — no explanation.
 

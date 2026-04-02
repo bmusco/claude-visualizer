@@ -2323,9 +2323,17 @@ wss.on('connection', (ws, req) => {
               });
               output += resumeResult.text;
 
-              if (succeeded) break; // Claude summarized — done
-              if (resumeResult.sql) { currentSql = resumeResult.sql; } // Loop continues with new SQL
-              else { console.log(`[SQL-EXEC] Claude responded without new SQL — stopping`); break; }
+              if (resumeResult.sql) {
+                // Claude wants to run another query — keep going even if last one "succeeded"
+                console.log(`[SQL-EXEC] Claude produced new SQL, continuing loop`);
+                currentSql = resumeResult.sql;
+              } else if (succeeded) {
+                console.log(`[SQL-EXEC] Claude summarized results — done`);
+                break;
+              } else {
+                console.log(`[SQL-EXEC] Claude responded without new SQL — stopping`);
+                break;
+              }
             }
           }
         }

@@ -2219,6 +2219,8 @@ wss.on('connection', (ws, req) => {
 
         if (sqlBlocks.length > 0 && convId) {
           console.log(`[SQL-EXEC] Found ${sqlBlocks.length} SQL blocks, session: ${warmSessions.get(convId)?.sessionId || 'none'}`);
+          // Clear the initial streamed text — we'll show clean final output instead
+          safeSend({ action: 'chat-replace', text: '' });
 
           for (const sql of sqlBlocks) {
             let db = detectDatabase(sql);

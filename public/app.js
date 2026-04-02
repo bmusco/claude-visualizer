@@ -395,6 +395,56 @@ function saveDbCredentials(btn) {
     });
 }
 
+function quickImportDbCredentials(btn) {
+  const textarea = document.getElementById('db-quick-paste');
+  const raw = (textarea ? textarea.value : '').trim();
+  const statusMsg = document.getElementById('status-database');
+
+  if (!raw) {
+    if (statusMsg) { statusMsg.textContent = 'Paste the output of the command above first.'; statusMsg.className = 'settings-status-msg err'; }
+    return;
+  }
+
+  // Parse key=value lines from AWS credentials file format
+  const get = (key) => { const m = raw.match(new RegExp(key + '\\s*=\\s*(.+)')); return m ? m[1].trim() : ''; };
+  const accessKeyId = get('aws_access_key_id');
+  const secretAccessKey = get('aws_secret_access_key');
+  const sessionToken = get('aws_session_token');
+  const expiration = get('aws_session_expiration');
+
+  if (!accessKeyId || !secretAccessKey || !sessionToken) {
+    if (statusMsg) { statusMsg.textContent = 'Could not parse credentials. Make sure you pasted the full output.'; statusMsg.className = 'settings-status-msg err'; }
+    return;
+  }
+
+  btn.textContent = 'Saving...';
+  btn.disabled = true;
+
+  fetch(`${API_BASE}/api/db-credentials`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accessKeyId, secretAccessKey, sessionToken, expiration })
+  })
+    .then(r => r.json())
+    .then(data => {
+      if (data.ok) {
+        if (statusMsg) { statusMsg.textContent = 'Credentials imported successfully!'; statusMsg.className = 'settings-status-msg ok'; }
+        textarea.value = '';
+        checkDbCredentialStatus();
+        dismissDbBanner();
+      } else {
+        if (statusMsg) { statusMsg.textContent = data.error || 'Failed to save'; statusMsg.className = 'settings-status-msg err'; }
+      }
+      btn.textContent = 'Import Credentials';
+      btn.disabled = false;
+    })
+    .catch(() => {
+      if (statusMsg) { statusMsg.textContent = 'Error saving credentials'; statusMsg.className = 'settings-status-msg err'; }
+      btn.textContent = 'Import Credentials';
+      btn.disabled = false;
+    });
+}
+
 function autoFillDbCredentials(btn) {
   const origText = btn.textContent;
   btn.textContent = 'Fetching...';
@@ -3568,6 +3618,13 @@ function handleChatMessage(data) {
     gslidesCreatedThisResponse = false;
     _lastGSlidesAttemptLen = 0;
     lastCreatedPanelType = null;
+  } else if (data.action === 'chat-replace') {
+    // Replace current response content (used when SQL execution takes over)
+    currentResponseText = data.text || '';
+    if (currentResponseEl) {
+      const contentWrapper = currentResponseEl.querySelector('.chat-msg-content');
+      if (contentWrapper) contentWrapper.innerHTML = data.text ? marked.parse(data.text) : '';
+    }
   } else if (data.action === 'chat-status') {
     if (!streamingElsewhere) updateStatus(data.text);
   } else if (data.action === 'chat-thinking-start') {
@@ -4574,14 +4631,23 @@ function renderSettingsModal() {
         </div>
         <span class="integration-badge checking" id="badge-database">Checking...</span>
       </div>
-      <div class="integration-instructions">After running <code>cmtaws sso login</code>, get your credentials:<br><code style="font-size:11px">aws configure get aws_access_key_id --profile cmtelematics-sso-user</code></div>
-      <input type="text" class="integration-field" id="db-access-key" placeholder="AWS Access Key ID">
-      <input type="password" class="integration-field" id="db-secret-key" placeholder="AWS Secret Access Key">
-      <input type="password" class="integration-field" id="db-session-token" placeholder="AWS Session Token">
-      <input type="text" class="integration-field" id="db-expiration" placeholder="Expiration (optional, e.g. 2026-04-02T14:00:00Z)">
+      <div class="integration-instructions" style="margin-bottom:8px">
+        <strong>Quick Import:</strong> Run this in your terminal, then paste the output below:<br>
+        <code id="db-quick-cmd" style="font-size:11px;display:block;margin:6px 0;padding:8px;background:#1a1a2e;border-radius:4px;cursor:pointer;user-select:all" onclick="navigator.clipboard.writeText(this.textContent).then(()=>{this.style.outline='2px solid #527FFF';setTimeout(()=>this.style.outline='',800)})">cat ~/.aws/credentials | sed -n '/\\[cmtelematics-sso-user\\]/,/^\\[/p' | head -5</code>
+        <span style="font-size:11px;color:#888">Click the command to copy it</span>
+      </div>
+      <textarea class="integration-field" id="db-quick-paste" placeholder="Paste the output here..." style="min-height:80px;font-family:monospace;font-size:12px;resize:vertical"></textarea>
       <div class="integration-card-actions" id="actions-database">
-        <button class="settings-action-btn connect-btn" id="connect-btn-database" onclick="saveDbCredentials(this)">Save Database Credentials</button>
-        <button class="settings-action-btn" onclick="autoFillDbCredentials(this)" style="margin-left:8px">Auto-fill from CLI</button>
+        <button class="settings-action-btn connect-btn" id="connect-btn-database" onclick="quickImportDbCredentials(this)">Import Credentials</button>
+        <button class="settings-action-btn" onclick="autoFillDbCredentials(this)" style="margin-left:8px">Auto-fill from Server</button>
+        <button class="settings-action-btn" onclick="document.getElementById('db-manual-fields').style.display=document.getElementById('db-manual-fields').style.display==='none'?'block':'none'" style="margin-left:8px;font-size:11px">Manual Entry</button>
+      </div>
+      <div id="db-manual-fields" style="display:none;margin-top:8px">
+        <input type="text" class="integration-field" id="db-access-key" placeholder="AWS Access Key ID">
+        <input type="password" class="integration-field" id="db-secret-key" placeholder="AWS Secret Access Key">
+        <input type="password" class="integration-field" id="db-session-token" placeholder="AWS Session Token">
+        <input type="text" class="integration-field" id="db-expiration" placeholder="Expiration (optional)">
+        <button class="settings-action-btn connect-btn" onclick="saveDbCredentials(this)" style="margin-top:4px">Save Manual Credentials</button>
       </div>
       <div class="settings-status-msg" id="status-database"></div>
     </div>

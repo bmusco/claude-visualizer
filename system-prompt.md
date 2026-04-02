@@ -233,9 +233,16 @@ Key tables in the prod aurora database:
 **app_users** - Application users
 
 ### Data Query Protocol
-**Before running any database query, check the Known Query Patterns below first.** If a pattern exists for what you need, use it directly — don't re-discover table joins from scratch. Only explore the schema if no pattern matches.
+**Database query rules:**
+1. Check the Known Query Patterns below FIRST — use them directly, don't reinvent joins
+2. Output SQL in ```sql code blocks — the system auto-executes and shows results
+3. Do NOT use psql, bash, or shell commands for queries
+4. Do NOT memorize or cache query results — data changes constantly
+5. DO memorize query patterns, table names, column names, and join relationships you discover
+6. If a query fails with "column does not exist", remember which columns actually exist for next time
+7. Start simple (SELECT COUNT(*) or SELECT * LIMIT 5) to verify tables/columns before complex queries
 
-**Default database: prod_redshift** (use prod_redshift unless told otherwise).
+**Current database: cmt-alpha (dev).** Tables and schema match production but data is smaller.
 
 **Known Query Patterns:**
 

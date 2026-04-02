@@ -1952,12 +1952,15 @@ wss.on('connection', (ws, req) => {
                 rows = cached.rows;
                 fields = cached.fields;
                 duration = cached.duration;
+                console.log(`[SQL-EXEC] Cache hit for query`);
               } else {
+                console.log(`[SQL-EXEC] Executing: ${sql.slice(0, 100)}...`);
                 const result = await executeRedshiftQuery(sql);
                 duration = Date.now() - start;
                 fields = result.fields;
                 rows = result.rows;
                 queryCache.set(cacheKey, { rows, fields, ts: Date.now(), duration });
+                console.log(`[SQL-EXEC] Success: ${rows.length} rows, ${duration}ms`);
               }
 
               ws.send(JSON.stringify({
@@ -1969,6 +1972,7 @@ wss.on('connection', (ws, req) => {
                 duration,
               }));
             } catch (err) {
+              console.error(`[SQL-EXEC] Error: ${err.message}`);
               ws.send(JSON.stringify({
                 action: 'query-error',
                 sql: sql.slice(0, 200),

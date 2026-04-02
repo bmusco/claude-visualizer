@@ -861,87 +861,79 @@ app.post('/api/config/reauth/:server', (req, res) => {
   res.json({ ok: result.status === 0, output: output.slice(0, 300) });
 });
 
-// ── Direct SQL query endpoint (Option A) ──────────────────────────
-const { Pool } = require('pg');
-const pgPool = new Pool({
-  user: 'bmusco@cmtelematics.com',
-  host: '127.0.0.1',
-  port: 13626,
-  password: 'magic',
-  database: 'prod_redshift',
-  ssl: false,
-  connectionTimeoutMillis: 10000,
-  query_timeout: 120000,
-});
+// ── Redshift Data API — no VPC tunneling needed ──────────────────
+const { RedshiftDataClient, ExecuteStatementCommand, DescribeStatementCommand, GetStatementResultCommand } = require('@aws-sdk/client-redshift-data');
+const redshiftData = new RedshiftDataClient({ region: process.env.REDSHIFT_REGION || 'us-east-1' });
 
-// Query result cache: sql hash -> { rows, fields, ts }
+const REDSHIFT_CLUSTER = process.env.REDSHIFT_CLUSTER || 'cmt-cmt-alpha-analytics';
+const REDSHIFT_DATABASE = process.env.REDSHIFT_DATABASE || 'cmt_alpha_vtrack';
+const REDSHIFT_DB_USER = process.env.REDSHIFT_DB_USER || 'bmusco@cmtelematics.com';
+
 const queryCache = new Map();
-const QUERY_CACHE_TTL = 5 * 60 * 1000; // 5 min
+const QUERY_CACHE_TTL = 5 * 60 * 1000;
 
 function sqlCacheKey(sql) {
-  return require('crypto').createHash('md5').update(sql.trim()).digest('hex');
+  return crypto.createHash('md5').update(sql.trim()).digest('hex');
+}
+
+async function executeRedshiftQuery(sql) {
+  const execResp = await redshiftData.send(new ExecuteStatementCommand({
+    ClusterIdentifier: REDSHIFT_CLUSTER,
+    Database: REDSHIFT_DATABASE,
+    DbUser: REDSHIFT_DB_USER,
+    Sql: sql,
+  }));
+
+  const stmtId = execResp.Id;
+  let status = 'SUBMITTED';
+  let attempts = 0;
+
+  while (status !== 'FINISHED' && status !== 'FAILED' && status !== 'ABORTED' && attempts < 60) {
+    await new Promise(r => setTimeout(r, attempts < 5 ? 500 : 2000));
+    const desc = await redshiftData.send(new DescribeStatementCommand({ Id: stmtId }));
+    status = desc.Status;
+    if (status === 'FAILED') throw new Error(desc.Error || 'Query failed');
+    if (status === 'ABORTED') throw new Error('Query aborted');
+    attempts++;
+  }
+
+  if (status !== 'FINISHED') throw new Error('Query timeout');
+
+  const result = await redshiftData.send(new GetStatementResultCommand({ Id: stmtId }));
+  const fields = (result.ColumnMetadata || []).map(c => c.name);
+  const rows = (result.Records || []).map(row =>
+    Object.fromEntries(row.map((cell, i) => {
+      const val = cell.stringValue ?? cell.longValue ?? cell.doubleValue ?? cell.booleanValue ?? null;
+      return [fields[i], val];
+    }))
+  );
+
+  return { fields, rows };
 }
 
 app.post('/api/query', express.json(), async (req, res) => {
-  const { sql, database } = req.body;
+  const { sql } = req.body;
   if (!sql) return res.status(400).json({ ok: false, error: 'Missing sql parameter' });
 
-  // Basic safety: block destructive statements
   const upper = sql.trim().toUpperCase();
   if (/^\s*(DROP|DELETE|TRUNCATE|ALTER|INSERT|UPDATE|CREATE|GRANT|REVOKE)\b/.test(upper)) {
     return res.status(403).json({ ok: false, error: 'Only SELECT queries are allowed' });
   }
 
-  // Check cache
-  const cacheKey = sqlCacheKey(sql + (database || ''));
+  const cacheKey = sqlCacheKey(sql);
   const cached = queryCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < QUERY_CACHE_TTL) {
     return res.json({ ok: true, rows: cached.rows, fields: cached.fields, cached: true, duration: cached.duration });
   }
 
-  const db = database || 'prod_redshift';
   const start = Date.now();
   try {
-    // Use a one-off client if database differs from pool default
-    let client;
-    let needRelease = false;
-    if (db !== 'prod_redshift') {
-      const { Client } = require('pg');
-      client = new Client({
-        user: 'bmusco@cmtelematics.com',
-        host: '127.0.0.1',
-        port: 13626,
-        password: 'magic',
-        database: db,
-        ssl: false,
-      });
-      await client.connect();
-      needRelease = true;
-    } else {
-      client = await pgPool.connect();
-      needRelease = true;
-    }
-
-    try {
-      const result = await client.query(sql);
-      const duration = Date.now() - start;
-      const fields = result.fields ? result.fields.map(f => f.name) : [];
-      const rows = result.rows || [];
-
-      // Cache result
-      queryCache.set(cacheKey, { rows, fields, ts: Date.now(), duration });
-
-      res.json({ ok: true, rows, fields, rowCount: rows.length, duration });
-    } finally {
-      if (needRelease) {
-        if (db !== 'prod_redshift') {
-          client.end().catch(() => {});
-        } else {
-          client.release();
-        }
-      }
-    }
+    const { fields, rows } = await executeRedshiftQuery(sql);
+    const duration = Date.now() - start;
+    queryCache.set(cacheKey, { rows, fields, ts: Date.now(), duration });
+    res.json({ ok: true, rows, fields, rowCount: rows.length, duration });
   } catch (err) {
+    console.error('[REDSHIFT]', err.message);
     res.json({ ok: false, error: err.message, duration: Date.now() - start });
   }
 });
@@ -1953,7 +1945,6 @@ wss.on('connection', (ws, req) => {
               ws.send(JSON.stringify({ action: 'chat-status', text: 'Running query...' }));
               const start = Date.now();
 
-              // Check cache first
               const cacheKey = sqlCacheKey(sql);
               const cached = queryCache.get(cacheKey);
               let rows, fields, duration;
@@ -1963,24 +1954,18 @@ wss.on('connection', (ws, req) => {
                 fields = cached.fields;
                 duration = cached.duration;
               } else {
-                const client = await pgPool.connect();
-                try {
-                  const result = await client.query(sql);
-                  duration = Date.now() - start;
-                  fields = result.fields ? result.fields.map(f => f.name) : [];
-                  rows = result.rows || [];
-                  queryCache.set(cacheKey, { rows, fields, ts: Date.now(), duration });
-                } finally {
-                  client.release();
-                }
+                const result = await executeRedshiftQuery(sql);
+                duration = Date.now() - start;
+                fields = result.fields;
+                rows = result.rows;
+                queryCache.set(cacheKey, { rows, fields, ts: Date.now(), duration });
               }
 
-              // Send query results to the UI
               ws.send(JSON.stringify({
                 action: 'query-result',
                 sql: sql.slice(0, 200),
                 fields,
-                rows: rows.slice(0, 1000), // cap at 1000 rows for the UI
+                rows: rows.slice(0, 1000),
                 rowCount: rows.length,
                 duration,
               }));

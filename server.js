@@ -861,16 +861,45 @@ app.post('/api/config/reauth/:server', (req, res) => {
   res.json({ ok: result.status === 0, output: output.slice(0, 300) });
 });
 
-// ── Database queries via pgproxy sidecar (supports Redshift + Aurora) ──
+// ── Database queries: pgproxy (local dev) + Redshift Data API (ECS fallback) ──
 const { Pool } = require('pg');
+const { RedshiftDataClient, ExecuteStatementCommand, DescribeStatementCommand, GetStatementResultCommand } = require('@aws-sdk/client-redshift-data');
 
+// pgproxy config (works on dev laptops with cmtaws sso login)
 const PGPROXY_HOST = process.env.PGPROXY_HOST || '127.0.0.1';
 const PGPROXY_PORT = parseInt(process.env.PGPROXY_PORT || '13626');
 const PGPROXY_USER = process.env.PGPROXY_USER || 'bmusco@cmtelematics.com';
 const PGPROXY_PASSWORD = process.env.PGPROXY_PASSWORD || 'magic';
 const DEFAULT_DATABASE = process.env.DEFAULT_DATABASE || 'prod_redshift';
 
-// Pool cache: one pool per database name
+// Redshift Data API config (works in ECS with task IAM role, no tunneling needed)
+const REDSHIFT_CLUSTER = process.env.REDSHIFT_CLUSTER || 'cmt-prod-analytics';
+const REDSHIFT_DATABASE = process.env.REDSHIFT_DATABASE || 'prod_vtrack';
+const REDSHIFT_DB_USER = process.env.REDSHIFT_DB_USER || 'bmusco@cmtelematics.com';
+const redshiftData = new RedshiftDataClient({ region: process.env.REDSHIFT_REGION || 'us-east-1' });
+
+// Detect pgproxy availability at startup — if unreachable, use Redshift Data API
+let pgproxyAvailable = null; // null = not checked yet
+async function checkPgproxy() {
+  try {
+    const testPool = new Pool({
+      host: PGPROXY_HOST, port: PGPROXY_PORT, user: PGPROXY_USER,
+      password: PGPROXY_PASSWORD, database: DEFAULT_DATABASE,
+      ssl: false, max: 1, connectionTimeoutMillis: 5000,
+    });
+    const client = await testPool.connect();
+    client.release();
+    await testPool.end();
+    pgproxyAvailable = true;
+    console.log('[DB] pgproxy available — using pgproxy for all queries');
+  } catch {
+    pgproxyAvailable = false;
+    console.log('[DB] pgproxy unavailable — using Redshift Data API (Aurora queries disabled)');
+  }
+}
+checkPgproxy();
+
+// Pool cache: one pool per database name (pgproxy mode only)
 const pgPools = new Map();
 function getPool(database) {
   const db = database || DEFAULT_DATABASE;
@@ -898,24 +927,69 @@ function sqlCacheKey(sql, database) {
 }
 
 // Detect which database a query needs based on table names
+const AURORA_TABLES = ['companies', 'fleets_fleet', 'companies_apps', 'teams_team', 'app_users',
+  'portal_company_config', 'fleets_nextgentagfleetinfo', 'fleet_scheduled_messages',
+  'byod_fleet_', 'geofences_', 'vehicles_v2'];
+
 function detectDatabase(sql) {
   const lower = sql.toLowerCase();
-  // Aurora clone tables (companies, fleets_fleet, teams_team, app_users, etc.)
-  const auroraTables = ['companies', 'fleets_fleet', 'companies_apps', 'teams_team', 'app_users',
-    'portal_company_config', 'fleets_nextgentagfleetinfo', 'fleet_scheduled_messages',
-    'byod_fleet_', 'geofences_'];
-  for (const t of auroraTables) {
+  for (const t of AURORA_TABLES) {
     if (lower.includes(t)) return 'prod_clone';
   }
   return DEFAULT_DATABASE;
 }
 
+function isAuroraQuery(database) {
+  return database && database.includes('clone');
+}
+
+// Redshift Data API executor (ECS fallback)
+async function executeRedshiftDataApi(sql) {
+  const execResp = await redshiftData.send(new ExecuteStatementCommand({
+    ClusterIdentifier: REDSHIFT_CLUSTER,
+    Database: REDSHIFT_DATABASE,
+    DbUser: REDSHIFT_DB_USER,
+    Sql: sql,
+  }));
+
+  let status = 'SUBMITTED', attempts = 0;
+  while (status !== 'FINISHED' && status !== 'FAILED' && status !== 'ABORTED' && attempts < 60) {
+    await new Promise(r => setTimeout(r, attempts < 5 ? 500 : 2000));
+    const desc = await redshiftData.send(new DescribeStatementCommand({ Id: execResp.Id }));
+    status = desc.Status;
+    if (status === 'FAILED') throw new Error(desc.Error || 'Query failed');
+    if (status === 'ABORTED') throw new Error('Query aborted');
+    attempts++;
+  }
+  if (status !== 'FINISHED') throw new Error('Query timeout after 120s');
+
+  const result = await redshiftData.send(new GetStatementResultCommand({ Id: execResp.Id }));
+  const fields = (result.ColumnMetadata || []).map(c => c.name);
+  const rows = (result.Records || []).map(record =>
+    Object.fromEntries(fields.map((f, i) => [f, record[i].stringValue ?? record[i].longValue ?? record[i].doubleValue ?? record[i].booleanValue ?? null]))
+  );
+  return { fields, rows };
+}
+
+// Unified query executor — picks the right backend
 async function executeQuery(sql, database) {
   const db = database || detectDatabase(sql);
-  const pool = getPool(db);
-  const result = await pool.query(sql);
-  const fields = (result.fields || []).map(f => f.name);
-  const rows = result.rows || [];
+
+  // pgproxy available: use it for everything (Redshift + Aurora)
+  if (pgproxyAvailable) {
+    const pool = getPool(db);
+    const result = await pool.query(sql);
+    const fields = (result.fields || []).map(f => f.name);
+    return { fields, rows: result.rows || [], database: db };
+  }
+
+  // pgproxy unavailable (ECS): Aurora queries not supported
+  if (isAuroraQuery(db)) {
+    throw new Error(`Aurora queries (${db}) require pgproxy which is not available in this environment. This query references Aurora-only tables. Try rephrasing to use Redshift analytics tables instead.`);
+  }
+
+  // Fall back to Redshift Data API
+  const { fields, rows } = await executeRedshiftDataApi(sql);
   return { fields, rows, database: db };
 }
 

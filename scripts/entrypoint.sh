@@ -29,6 +29,14 @@ if [ -n "$CLAUDE_CONFIG_TAR_B64" ] && [ "$CLAUDE_CONFIG_TAR_B64" != "placeholder
     source "$HOME/.oauth-env"
     echo "[entrypoint] OAuth env vars loaded"
   fi
+
+  # Create memory directory if it doesn't exist
+  MEMORY_DIR="${CLAUDIO_MEMORY_DIR:-$HOME/.claude/projects/-Users-bmusco/memory}"
+  mkdir -p "$MEMORY_DIR"
+  if [ ! -f "$MEMORY_DIR/MEMORY.md" ]; then
+    echo "# Claud-io Memory" > "$MEMORY_DIR/MEMORY.md"
+    echo "[entrypoint] Memory directory initialized"
+  fi
 fi
 
 exec "$@"

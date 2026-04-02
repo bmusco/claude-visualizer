@@ -3627,10 +3627,20 @@ function handleChatMessage(data) {
       });
     }
   } else if (data.action === 'query-result') {
-    // Auto-executed SQL result — render as a table below the chat response
     const tableHtml = renderQueryTable(data.fields, data.rows, data.rowCount, data.duration, data.sql);
-    const el = addChatMessage('assistant', tableHtml, false);
-    if (el) el.querySelector('.chat-msg-content').classList.add('query-result-msg');
+    const messages = document.getElementById('chat-messages');
+    const msg = document.createElement('div');
+    msg.className = 'chat-msg assistant';
+    const avatar = document.createElement('div');
+    avatar.className = 'chat-avatar assistant';
+    avatar.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="white"><path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"/></svg>';
+    const contentWrapper = document.createElement('div');
+    contentWrapper.className = 'chat-msg-content query-result-msg';
+    contentWrapper.innerHTML = tableHtml;
+    msg.appendChild(avatar);
+    msg.appendChild(contentWrapper);
+    messages.appendChild(msg);
+    messages.scrollTop = messages.scrollHeight;
   } else if (data.action === 'query-error') {
     addChatMessage('assistant', `**Query error:** ${escapeHtml(data.error)}\n\n\`\`\`sql\n${escapeHtml(data.sql)}...\n\`\`\``, true);
   } else if (data.action === 'chat-error') {

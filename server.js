@@ -1172,14 +1172,12 @@ async function executeQuery(sql, database) {
     return { fields, rows: result.rows || [], database: db };
   }
 
-  // pgproxy unavailable (ECS): Aurora queries not supported
-  if (isAuroraQuery(db)) {
-    throw new Error(`Aurora queries (${db}) require pgproxy which is not available in this environment. This query references Aurora-only tables. Try rephrasing to use Redshift analytics tables instead.`);
-  }
+  // pgproxy unavailable (ECS): redirect Aurora queries to Redshift
+  const effectiveDb = isAuroraQuery(db) ? DEFAULT_DATABASE : db;
 
   // Fall back to Redshift Data API with stored prod credentials
   const { fields, rows } = await executeRedshiftDataApi(sql);
-  return { fields, rows, database: db };
+  return { fields, rows, database: effectiveDb };
 }
 
 app.post('/api/query', express.json(), async (req, res) => {
@@ -2259,7 +2257,7 @@ wss.on('connection', (ws, req) => {
                   safeSend({ action: 'chat-chunk', text: `\n\n**Database error:** ${err.message}\n` });
                   break;
                 }
-                if (/Aurora queries.*require pgproxy/i.test(err.message)) db = DEFAULT_DATABASE;
+                // Aurora queries are now silently redirected to Redshift in executeQuery
                 safeSend({ action: 'chat-status', text: `Query error, retrying...` });
                 feedbackMsg = `Query failed on ${db}.\nSQL: ${currentSql}\nError: ${err.message}\n\nFix the query and output a new \`\`\`sql block. The user asked: "${userMessage}"`;
               }

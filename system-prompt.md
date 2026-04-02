@@ -197,7 +197,7 @@ export PGPASSWORD=magic
 **IMPORTANT: Do NOT run psql commands or bash commands for database queries.** Write SQL in a ```sql code block. The system auto-executes it, shows results, and feeds errors back to you for fixing.
 
 ### Data Query Protocol
-1. **SCHEMA RULE: ONLY use the `public` schema.** Never prefix tables with `analytics.` — write `SELECT ... FROM table_name`, not `SELECT ... FROM analytics.table_name`. The `analytics` schema should NOT be used unless the user explicitly asks for it.
+1. **SCHEMA RULE: Use the `public` schema by default** (prod_clone). Write `SELECT ... FROM table_name`. Only use `analytics` schema if explicitly querying prod_redshift.
 2. Write SQL in a ```sql code block — the system executes it and feeds results/errors back to you
 3. If a query errors, the error is sent back to you — fix the SQL and output a new ```sql block
 4. To discover tables: `SELECT DISTINCT tablename FROM pg_catalog.pg_tables WHERE schemaname='public' AND tablename LIKE '%keyword%'` — if this returns 0 rows, also try: `SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name LIKE '%keyword%'`
@@ -206,7 +206,7 @@ export PGPASSWORD=magic
 7. DO memorize query patterns, table names, column names, and join relationships you discover
 8. Check your memories for known table schemas and query patterns before writing SQL
 
-**Default database: prod_redshift** (Redshift serverless, database `prod_vtrack`). Tables are in the `public` schema. Do NOT use `analytics` schema. Aurora tables (prod_clone) may not be available — if you get an error, rewrite using Redshift tables.
+**Default database: prod_clone** (Aurora PostgreSQL). Tables are in the `public` schema. If prod_clone is unavailable, fall back to prod_redshift (Redshift, `analytics` schema).
 
 ### Jira (CTC Project)
 The main project is CTC (Commercial Telematics Cloud).

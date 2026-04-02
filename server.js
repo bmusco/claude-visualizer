@@ -918,7 +918,7 @@ const PGPROXY_HOST = process.env.PGPROXY_HOST || '127.0.0.1';
 const PGPROXY_PORT = parseInt(process.env.PGPROXY_PORT || '13626');
 const PGPROXY_USER = process.env.PGPROXY_USER || 'bmusco@cmtelematics.com';
 const PGPROXY_PASSWORD = process.env.PGPROXY_PASSWORD || 'magic';
-const DEFAULT_DATABASE = process.env.DEFAULT_DATABASE || 'prod_redshift';
+const DEFAULT_DATABASE = process.env.DEFAULT_DATABASE || 'prod_clone';
 
 // Redshift Serverless Data API config (prod — uses credentials from UI)
 const REDSHIFT_WORKGROUP = process.env.REDSHIFT_WORKGROUP || 'prod-research';
@@ -1060,24 +1060,29 @@ app.post('/api/db-credentials', express.json(), (req, res) => {
   res.json({ ok: true, message: 'Database credentials saved', ...getDbCredentialStatus() });
 });
 
-// Detect pgproxy availability at startup — if unreachable, use Redshift Data API
+// Detect pgproxy availability — retry several times since sidecar may start late
 let pgproxyAvailable = null; // null = not checked yet
-async function checkPgproxy() {
-  try {
-    const testPool = new Pool({
-      host: PGPROXY_HOST, port: PGPROXY_PORT, user: PGPROXY_USER,
-      password: PGPROXY_PASSWORD, database: DEFAULT_DATABASE,
-      ssl: false, max: 1, connectionTimeoutMillis: 5000,
-    });
-    const client = await testPool.connect();
-    client.release();
-    await testPool.end();
-    pgproxyAvailable = true;
-    console.log('[DB] pgproxy available — using pgproxy for all queries');
-  } catch {
-    pgproxyAvailable = false;
-    console.log('[DB] pgproxy unavailable — will use Redshift Data API with stored credentials');
+async function checkPgproxy(retries = 5, delayMs = 5000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const testPool = new Pool({
+        host: PGPROXY_HOST, port: PGPROXY_PORT, user: PGPROXY_USER,
+        password: PGPROXY_PASSWORD, database: DEFAULT_DATABASE,
+        ssl: false, max: 1, connectionTimeoutMillis: 5000,
+      });
+      const client = await testPool.connect();
+      client.release();
+      await testPool.end();
+      pgproxyAvailable = true;
+      console.log(`[DB] pgproxy available on attempt ${i + 1} — using pgproxy for all queries`);
+      return;
+    } catch (err) {
+      console.log(`[DB] pgproxy check attempt ${i + 1}/${retries} failed: ${err.message}`);
+      if (i < retries - 1) await new Promise(r => setTimeout(r, delayMs));
+    }
   }
+  pgproxyAvailable = false;
+  console.log('[DB] pgproxy unavailable after all retries — will use Redshift Data API with stored credentials');
 }
 checkPgproxy();
 

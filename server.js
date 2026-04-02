@@ -16,6 +16,23 @@ const PORT = process.env.PORT || 3333;
 const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || 'claude';
 const USER_HOME = process.env.CLAUDIO_HOME || os.homedir();
 
+// ── Clean up stale MCP config ────────────────────────────────────
+// Remove claudio-db from .mcp.json if present (MCP approach abandoned, using post-hoc SQL execution)
+const MCP_JSON_PATH = path.join(__dirname, '.mcp.json');
+try {
+  const mcpConfig = JSON.parse(fs.readFileSync(MCP_JSON_PATH, 'utf-8'));
+  if (mcpConfig.mcpServers && mcpConfig.mcpServers['claudio-db']) {
+    delete mcpConfig.mcpServers['claudio-db'];
+    if (Object.keys(mcpConfig.mcpServers).length === 0) {
+      fs.unlinkSync(MCP_JSON_PATH);
+      console.log(`[MCP] Removed stale ${MCP_JSON_PATH}`);
+    } else {
+      fs.writeFileSync(MCP_JSON_PATH, JSON.stringify(mcpConfig, null, 2));
+      console.log(`[MCP] Removed claudio-db from ${MCP_JSON_PATH}`);
+    }
+  }
+} catch {}
+
 // ── MCP integration test commands (shared across endpoints) ─────
 const MCP_TEST_COMMANDS = {
   'google-workspace': 'Use the mcp__google-workspace__gdrive_search tool to search for "test" with max 1 result. Return only the result.',
@@ -846,6 +863,9 @@ app.post('/api/config/aws-credentials', (req, res) => {
 
     if (!accessKeyId || !secretAccessKey) return res.json({ ok: false, error: 'Credentials incomplete — run cmtaws sso login first' });
 
+    // Auto-save: also persist these credentials for Redshift Data API use
+    autoRefreshDbCredentials();
+
     res.json({ ok: true, accessKeyId, secretAccessKey, sessionToken, expiration });
   } catch (err) {
     res.json({ ok: false, error: err.message });
@@ -929,6 +949,72 @@ function loadDbCredentials() {
   }
 }
 loadDbCredentials();
+
+// Auto-refresh: read ~/.aws/credentials and populate db-credentials.json automatically
+function autoRefreshDbCredentials() {
+  try {
+    const credFile = path.join(os.homedir(), '.aws', 'credentials');
+    if (!fs.existsSync(credFile)) {
+      console.log('[DB] Auto-refresh: no ~/.aws/credentials file found');
+      return false;
+    }
+
+    const content = fs.readFileSync(credFile, 'utf-8');
+    const profile = 'cmtelematics-sso-user';
+    const profileRegex = new RegExp(`\\[${profile}\\]([\\s\\S]*?)(?=\\n\\[|$)`);
+    const match = content.match(profileRegex);
+    if (!match) {
+      console.log(`[DB] Auto-refresh: profile [${profile}] not found`);
+      return false;
+    }
+
+    const section = match[1];
+    const get = (key) => { const m = section.match(new RegExp(`${key}\\s*=\\s*(.+)`)); return m ? m[1].trim() : ''; };
+
+    const accessKeyId = get('aws_access_key_id');
+    const secretAccessKey = get('aws_secret_access_key');
+    const sessionToken = get('aws_session_token');
+    const expiration = get('aws_session_expiration');
+
+    if (!accessKeyId || !secretAccessKey || !sessionToken) {
+      console.log('[DB] Auto-refresh: credentials incomplete in ~/.aws/credentials');
+      return false;
+    }
+
+    // Skip if we already have the same access key loaded and it's not expired
+    if (dbCredentials && dbCredentials.accessKeyId === accessKeyId && dbCredentialsValid()) {
+      return true;
+    }
+
+    // Check if the AWS creds are expired before saving
+    if (expiration && new Date(expiration) < new Date()) {
+      console.log('[DB] Auto-refresh: AWS credentials expired at', expiration);
+      return false;
+    }
+
+    dbCredentials = { accessKeyId, secretAccessKey, sessionToken, expiration: expiration || null, updatedAt: new Date().toISOString() };
+    redshiftClient = new RedshiftDataClient({
+      region: REDSHIFT_REGION,
+      credentials: { accessKeyId, secretAccessKey, sessionToken },
+    });
+
+    // Persist to disk
+    const credDir = path.dirname(DB_CRED_PATH);
+    fs.mkdirSync(credDir, { recursive: true });
+    fs.writeFileSync(DB_CRED_PATH, JSON.stringify(dbCredentials, null, 2));
+    console.log('[DB] Auto-refreshed credentials from ~/.aws/credentials (key:', accessKeyId.slice(0, 8) + '...)');
+    return true;
+  } catch (err) {
+    console.error('[DB] Auto-refresh failed:', err.message);
+    return false;
+  }
+}
+
+// Auto-refresh on startup
+autoRefreshDbCredentials();
+
+// Auto-refresh every 30 minutes (catches cmtaws sso login renewals)
+setInterval(autoRefreshDbCredentials, 30 * 60 * 1000);
 
 function dbCredentialsValid() {
   if (!dbCredentials) return false;
@@ -1042,8 +1128,11 @@ function isAuroraQuery(database) {
 // Redshift Serverless Data API executor (prod, uses stored credentials)
 async function executeRedshiftDataApi(sql) {
   if (!redshiftClient || !dbCredentialsValid()) {
-    const status = getDbCredentialStatus();
-    throw new Error(`DB_CREDENTIALS_${status.status.toUpperCase()}: ${status.message}. Open Settings to add your AWS credentials.`);
+    // Try auto-refresh before failing
+    if (!autoRefreshDbCredentials()) {
+      const status = getDbCredentialStatus();
+      throw new Error(`DB_CREDENTIALS_${status.status.toUpperCase()}: ${status.message}. Open Settings to add your AWS credentials.`);
+    }
   }
 
   const execResp = await redshiftClient.send(new ExecuteStatementCommand({
@@ -1471,6 +1560,7 @@ function toolStatusLabel(name) {
     'mcp__atlassian__jira_search': 'Searching Jira...',
     'mcp__atlassian__jira_get_issue': 'Reading Jira issue...',
     'mcp__atlassian__jira_create_issue': 'Creating Jira issue...',
+    'mcp__claudio-db__execute_sql': 'Querying database...',
   };
   if (map[name]) return map[name];
   // Fallback: extract a readable label from tool name
@@ -1957,12 +2047,13 @@ wss.on('connection', (ws, req) => {
       const browserPreFetched = !!msg.browserPreFetched;
       const skipMcp = mcpPreFetched || browserPreFetched || canSkipMcp(userMessage, isEditing);
 
-      const cliArgs = ['-p', '--verbose', '--output-format', 'stream-json', '--include-partial-messages'];
+      const cliArgs = ['-p', '--verbose', '--output-format', 'stream-json', '--include-partial-messages', '--permission-mode', 'bypassPermissions'];
       if (selectedModel) cliArgs.push('--model', selectedModel);
 
-      // Quick mode: skip MCP servers entirely (saves 2-5s connection overhead)
+      // DB MCP tool is available via .mcp.json (written at startup)
+      // Quick mode: skip MCP servers (but Claude still connects to .mcp.json servers)
       if (skipMcp) {
-        cliArgs.push('--strict-mcp-config');
+        // Don't use --strict-mcp-config here — we need the claudio-db MCP server
       }
 
       // Warm session: resume previous session for this conversation
@@ -1975,29 +2066,16 @@ wss.on('connection', (ws, req) => {
       }
 
       let claude;
-      // If prompt is too large for CLI args (>100KB), pipe via temp file
-      if (Buffer.byteLength(fullPrompt) > 100000) {
-        const promptFile = path.join(os.tmpdir(), `claudio-prompt-${Date.now()}.txt`);
-        fs.writeFileSync(promptFile, fullPrompt);
-        claude = spawn(CLAUDE_CLI, cliArgs, {
-          env: { ...process.env, HOME: USER_HOME, CLAUDEIO_SESSION: '1' },
-          cwd: USER_HOME,
-          stdio: ['pipe', 'pipe', 'pipe']
-        });
-        // Pipe prompt via stdin
-        const promptStream = fs.createReadStream(promptFile);
-        promptStream.pipe(claude.stdin);
-        promptStream.on('end', () => {
-          setTimeout(() => { try { fs.unlinkSync(promptFile); } catch {} }, 2000);
-        });
-      } else {
-        cliArgs.push(fullPrompt);
-        claude = spawn(CLAUDE_CLI, cliArgs, {
-          env: { ...process.env, HOME: USER_HOME, CLAUDEIO_SESSION: '1' },
-          cwd: USER_HOME
-        });
-      }
+      // Always pipe prompt via stdin to avoid variadic flag conflicts (--mcp-config eats positional args)
+      claude = spawn(CLAUDE_CLI, cliArgs, {
+        env: { ...process.env, HOME: USER_HOME, CLAUDEIO_SESSION: '1' },
+        cwd: __dirname, // Use app dir so Claude finds .mcp.json with claudio-db tool
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      claude.stdin.write(fullPrompt);
+      claude.stdin.end();
 
+      console.log(`[CHAT] Spawning Claude CLI with args: ${cliArgs.filter(a => !a.includes('system-prompt')).join(' ').slice(0, 300)}`);
       chatSessions.set(ws, claude);
 
       let output = '';
@@ -2062,6 +2140,17 @@ wss.on('connection', (ws, req) => {
               }
               if (inToolUseBlock) {
                 inToolUseBlock = false;
+                // Show DB tool calls in the UI
+                if (currentToolName === 'mcp__claudio-db__execute_sql' && toolInputJson) {
+                  try {
+                    const toolInput = JSON.parse(toolInputJson);
+                    if (toolInput.sql) {
+                      const sqlDisplay = `\n\n\`\`\`sql\n${toolInput.sql}\n\`\`\`\n`;
+                      output += sqlDisplay;
+                      ws.send(JSON.stringify({ action: 'chat-chunk', text: sqlDisplay }));
+                    }
+                  } catch {}
+                }
                 // If model called gslides_create, inject a GSLIDES marker into the output
                 // so the client can create a canvas panel from it
                 if (currentToolName === 'mcp__google-workspace__gslides_create' && toolInputJson) {
@@ -2101,159 +2190,117 @@ wss.on('connection', (ws, req) => {
         }
       });
 
-      claude.stderr.on('data', () => {
-        // stderr may contain progress info; don't double-up thinking status
+      claude.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg) console.error(`[CLAUDE-STDERR] ${msg}`);
       });
 
       claude.on('close', async (code) => {
+        console.log(`[CHAT] Claude process closed with code ${code}, output length: ${output.length}`);
         chatSessions.delete(ws);
 
-        // Auto-execute SQL code blocks and retry up to 3 times on failure
+        // Auto-execute SQL from Claude's response, then resume session with results/errors
         const sqlBlockRegex = /```sql\n([\s\S]*?)```/g;
         let sqlMatch;
         const sqlBlocks = [];
         while ((sqlMatch = sqlBlockRegex.exec(output)) !== null) {
           const sql = sqlMatch[1].trim();
-          if (/^\s*SELECT\b/i.test(sql) || /^\s*WITH\b/i.test(sql)) {
-            sqlBlocks.push(sql);
-          }
+          if (/^\s*(SELECT|WITH)\b/i.test(sql)) sqlBlocks.push(sql);
         }
-        if (sqlBlocks.length > 0) {
+
+        if (sqlBlocks.length > 0 && convId) {
+          console.log(`[SQL-EXEC] Found ${sqlBlocks.length} SQL blocks, session: ${warmSessions.get(convId)?.sessionId || 'none'}`);
+
           for (const sql of sqlBlocks) {
             let db = detectDatabase(sql);
-            const cacheKey = sqlCacheKey(sql, db);
-            const cached = queryCache.get(cacheKey);
-
-            if (cached && Date.now() - cached.ts < QUERY_CACHE_TTL) {
-              const { rows, fields, duration } = cached;
-              console.log(`[SQL-EXEC] Cache hit`);
-              const resultText = formatQueryResult(fields, rows, duration);
-              output += resultText;
-              ws.send(JSON.stringify({ action: 'chat-chunk', text: resultText }));
-              continue;
-            }
-
-            // Try executing, retry up to 3 times with Claude fixing the SQL
+            const MAX_ITERATIONS = 10;
             let currentSql = sql;
-            let succeeded = false;
-            const MAX_RETRIES = 10;
-            const errorHistory = [];
 
-            for (let attempt = 0; attempt <= MAX_RETRIES && !succeeded; attempt++) {
+            for (let i = 0; i < MAX_ITERATIONS; i++) {
+              let feedbackMsg;
+              let succeeded = false;
               try {
                 const start = Date.now();
-                console.log(`[SQL-EXEC] ${attempt > 0 ? `Retry ${attempt}` : 'Executing'} on ${db}: ${currentSql.slice(0, 120)}...`);
+                console.log(`[SQL-EXEC] Iter ${i} on ${db}: ${currentSql.slice(0, 100)}...`);
                 const result = await executeQuery(currentSql, db);
                 const duration = Date.now() - start;
-                queryCache.set(sqlCacheKey(currentSql, db), { rows: result.rows, fields: result.fields, ts: Date.now(), duration });
                 console.log(`[SQL-EXEC] Success: ${result.rows.length} rows, ${duration}ms`);
-
-                // Check if this is a schema discovery query (not the actual answer)
-                const isDiscoveryQuery = /information_schema|pg_tables|pg_catalog|LIMIT\s+50\b/i.test(currentSql) && attempt > 0;
-                if (isDiscoveryQuery && attempt < MAX_RETRIES) {
-                  // Feed discovery results into next retry so Claude can write the real query
-                  const tableList = result.rows.slice(0, 30).map(r => Object.values(r).join('.')).join(', ');
-                  errorHistory.push({ sql: currentSql, error: `DISCOVERY_RESULT: Found tables: ${tableList}. Now write a query using these tables to answer the user's question.` });
-                  ws.send(JSON.stringify({ action: 'chat-chunk', text: `\n\n**Discovering available tables...** (${result.rows.length} found, ${duration}ms)\n` }));
-                  // Don't mark as succeeded — continue to next attempt
-                } else {
-                  const label = attempt > 0 ? 'Corrected query results' : 'Query results';
-                  const resultText = `\n\n**${label}** (${result.rows.length} row${result.rows.length !== 1 ? 's' : ''}, ${duration}ms, ${db}):\n\n` +
-                    formatMarkdownTable(result.fields, result.rows);
-                  output += resultText;
-                  ws.send(JSON.stringify({ action: 'chat-chunk', text: resultText }));
-                  succeeded = true;
+                const fields = result.fields;
+                let table = '| ' + fields.join(' | ') + ' |\n| ' + fields.map(() => '---').join(' | ') + ' |\n';
+                for (const row of result.rows.slice(0, 50)) {
+                  table += '| ' + fields.map(f => String(row[f] ?? '')).join(' | ') + ' |\n';
                 }
+                if (result.rows.length > 50) table += `\n*...and ${result.rows.length - 50} more rows*\n`;
+                const resultText = `\n\n**Query results** (${result.rows.length} rows, ${duration}ms, ${db}):\n\n${table}`;
+                output += resultText;
+                ws.send(JSON.stringify({ action: 'chat-chunk', text: resultText }));
+                succeeded = true;
+                feedbackMsg = `Query on ${db} returned ${result.rows.length} rows (${duration}ms):\n\n${table}\n\nSummarize these results to answer the user's question.`;
               } catch (err) {
-                console.error(`[SQL-EXEC] Attempt ${attempt} error: ${err.message}`);
-
-                // Don't retry hard connection/auth errors — bail immediately
-                const isHardError = /ECONNREFUSED|ETIMEDOUT|active profiles|sso login|DB_CREDENTIALS_|ENOTFOUND/i.test(err.message);
-                if (isHardError) {
-                  const errText = `\n\n**Database connection error:** ${err.message}\n`;
-                  output += errText;
-                  ws.send(JSON.stringify({ action: 'chat-chunk', text: errText }));
+                console.error(`[SQL-EXEC] Iter ${i} error: ${err.message}`);
+                if (/ECONNREFUSED|ETIMEDOUT|DB_CREDENTIALS_|ENOTFOUND/i.test(err.message)) {
+                  ws.send(JSON.stringify({ action: 'chat-chunk', text: `\n\n**Database error:** ${err.message}\n` }));
                   break;
                 }
-
-                // Aurora unavailable — tell Claude to rewrite for Redshift instead
-                const isAuroraUnavailable = /Aurora queries.*require pgproxy/i.test(err.message);
-                if (isAuroraUnavailable) {
-                  db = DEFAULT_DATABASE; // switch to Redshift for retries
-                }
-
-                errorHistory.push({ sql: currentSql, error: err.message });
-
-                if (attempt < MAX_RETRIES) {
-                  ws.send(JSON.stringify({ action: 'chat-chunk', text: `\n\n**Query error:** ${err.message}\nRetrying (${attempt + 1}/${MAX_RETRIES})...\n` }));
-
-                  let retryPrompt;
-                  if (isAuroraUnavailable) {
-                    retryPrompt = `You are a SQL expert for CMT databases. The user asked: "${userMessage}"
-
-The Aurora database (prod_clone) is NOT available. The original query used Aurora tables:
-${currentSql}
-
-You MUST rewrite this to answer the user's question using ONLY Redshift analytics tables (prod_redshift).
-
-Aurora tables NOT available: fleets_fleet, companies, companies_apps, teams_team, app_users, vehicles_v2, portal_company_config
-
-Known Redshift tables:
-- analytics.triplog_trips: fleet_id, user_id, mileage_est_km, start_time, etc.
-- analytics.app_user_fleet_scores_history: fleet_id, score, created_at
-- analytics.tag_status_latest: device/tag data with fleet_id
-- analytics.vehicles_trip_summary: vehicle trip aggregates
-- Try: SELECT DISTINCT tablename FROM pg_tables WHERE schemaname='analytics' AND tablename LIKE '%vehicle%' to discover tables
-
-${errorHistory.length > 1 ? errorHistory.map((e, i) => `Attempt ${i + 1}:\nSQL: ${e.sql}\nError: ${e.error}`).join('\n\n') : ''}
-
-Output ONLY a \`\`\`sql code block that answers the user's question. Do NOT just list tables — write a query that gets the actual answer.`;
-                  } else {
-                    retryPrompt = `You are a SQL expert for CMT databases. Fix this query. Output ONLY a corrected \`\`\`sql code block — no explanation.
-
-Database: ${db} (${db.includes('clone') ? 'Aurora/Postgres' : 'Redshift'})
-${db.includes('clone') ? 'Key tables: companies (companyid, name), fleets_fleet (id, name, viewing_company_id, app_id, deleted), companies_apps (id, company_id), teams_team (id, name, fleet_id, viewing_company_id)' : 'Schema: Redshift analytics'}
-
-${errorHistory.map((e, i) => `Attempt ${i + 1}:\nSQL: ${e.sql}\nError: ${e.error}`).join('\n\n')}
-
-Fix the latest error. If a table/column doesn't exist, try discovering it with: SELECT * FROM <table> LIMIT 1`;
-                  }
-
-                  const retryResult = spawnSync(CLAUDE_CLI, ['-p', '--output-format', 'text', '--max-turns', '1', retryPrompt], {
-                    encoding: 'utf-8',
-                    timeout: 30000,
-                    env: { ...process.env, HOME: USER_HOME },
-                    cwd: USER_HOME
-                  });
-                  const retryOutput = (retryResult.stdout || '').trim();
-                  // Try multiple patterns to extract SQL
-                  const retryMatch = retryOutput.match(/```sql\n([\s\S]*?)```/) || retryOutput.match(/```\n?(SELECT[\s\S]*?)```/i) || retryOutput.match(/(SELECT\b[\s\S]*?;)\s*$/im);
-                  if (retryMatch && /^\s*(SELECT|WITH)\b/i.test(retryMatch[1].trim())) {
-                    currentSql = retryMatch[1].trim();
-                  } else {
-                    // Claude didn't produce valid SQL — add to error history and keep trying
-                    console.log(`[SQL-EXEC] Retry ${attempt} didn't produce SQL: ${retryOutput.slice(0, 200)}`);
-                    errorHistory.push({ sql: '(no SQL produced)', error: `Claude responded but did not output a SQL query. Response: ${retryOutput.slice(0, 300)}` });
-                  }
-                } else {
-                  const errText = `\n\n**Query failed after ${MAX_RETRIES} retries:** ${err.message}\n`;
-                  output += errText;
-                  ws.send(JSON.stringify({ action: 'chat-chunk', text: errText }));
-                }
+                if (/Aurora queries.*require pgproxy/i.test(err.message)) db = DEFAULT_DATABASE;
+                ws.send(JSON.stringify({ action: 'chat-chunk', text: `\n\n**Query error:** ${err.message} — retrying...\n` }));
+                feedbackMsg = `Query failed on ${db}.\nSQL: ${currentSql}\nError: ${err.message}\n\nFix the query and output a new \`\`\`sql block. The user asked: "${userMessage}"`;
               }
+
+              // Resume Claude session with feedback
+              const sid = warmSessions.get(convId)?.sessionId;
+              if (!sid || !feedbackMsg) { console.log(`[SQL-EXEC] No session (${sid}) or feedback — stopping`); break; }
+
+              console.log(`[SQL-EXEC] Resuming session ${sid} with ${succeeded ? 'results' : 'error'}...`);
+              ws.send(JSON.stringify({ action: 'chat-status', text: succeeded ? 'Summarizing results...' : 'Fixing query...' }));
+
+              const resumeResult = await new Promise((resolve) => {
+                const args = ['-p', '--output-format', 'stream-json', '--permission-mode', 'bypassPermissions', '--resume', sid];
+                const proc = spawn(CLAUDE_CLI, args, {
+                  env: { ...process.env, HOME: USER_HOME, CLAUDEIO_SESSION: '1' },
+                  cwd: __dirname,
+                  stdio: ['pipe', 'pipe', 'pipe']
+                });
+                proc.stdin.write(feedbackMsg);
+                proc.stdin.end();
+
+                let buf = '', text = '', newSql = null;
+                proc.stdout.on('data', (d) => {
+                  buf += d.toString();
+                  const lines = buf.split('\n'); buf = lines.pop();
+                  for (const line of lines) {
+                    if (!line.trim()) continue;
+                    try {
+                      const p = JSON.parse(line);
+                      const ev = p.type === 'stream_event' ? p.event : p;
+                      const et = ev?.type || p.type;
+                      if (et === 'content_block_delta') {
+                        const delta = ev.delta || {};
+                        if (delta.type === 'text_delta' && delta.text) { text += delta.text; ws.send(JSON.stringify({ action: 'chat-chunk', text: delta.text })); }
+                        else if (delta.type === 'thinking_delta' && delta.thinking) { ws.send(JSON.stringify({ action: 'chat-thinking-delta', text: delta.thinking })); }
+                      } else if (p.type === 'result' || et === 'result') {
+                        const r = p.result || ev.result; if (r) text = r;
+                        const newSid = p.session_id || p.sessionId || ev?.session_id;
+                        if (newSid) warmSessions.set(convId, { sessionId: newSid, lastUsed: Date.now() });
+                      }
+                    } catch {}
+                  }
+                });
+                proc.stderr.on('data', (d) => console.error(`[SQL-RESUME-STDERR] ${d.toString().trim()}`));
+                proc.on('close', () => {
+                  const m = text.match(/```sql\n([\s\S]*?)```/);
+                  if (m && /^\s*(SELECT|WITH)\b/i.test(m[1].trim())) newSql = m[1].trim();
+                  resolve({ text, sql: newSql });
+                });
+                setTimeout(() => { try { proc.kill(); } catch {} }, 90000);
+              });
+              output += resumeResult.text;
+
+              if (succeeded) break; // Claude summarized — done
+              if (resumeResult.sql) { currentSql = resumeResult.sql; } // Loop continues with new SQL
+              else break; // Claude responded without SQL — done
             }
           }
-        }
-
-        function formatMarkdownTable(fields, rows) {
-          if (!fields.length || !rows.length) return '*No results*\n';
-          let t = '| ' + fields.join(' | ') + ' |\n';
-          t += '| ' + fields.map(() => '---').join(' | ') + ' |\n';
-          for (const row of rows.slice(0, 50)) {
-            t += '| ' + fields.map(f => String(row[f] ?? '')).join(' | ') + ' |\n';
-          }
-          if (rows.length > 50) t += `\n*...and ${rows.length - 50} more rows*\n`;
-          return t;
         }
 
         // Save assistant response to history
@@ -2355,6 +2402,10 @@ app.post('/api/export/slides', async (req, res) => {
 // ── Memory API ───────────────────────────────────────────────────
 const MEMORY_DIR = process.env.CLAUDIO_MEMORY_DIR || path.join(USER_HOME, '.claude', 'projects', '-Users-bmusco', 'memory');
 
+// Ensure memory dir exists
+try { fs.mkdirSync(MEMORY_DIR, { recursive: true }); } catch {}
+console.log('[Memory] Directory:', MEMORY_DIR, 'exists:', fs.existsSync(MEMORY_DIR));
+
 function parseMemoryIndex() {
   const indexPath = path.join(MEMORY_DIR, 'MEMORY.md');
   try {
@@ -2365,7 +2416,22 @@ function parseMemoryIndex() {
   }
 }
 
+function parseMemoryFrontmatter(content) {
+  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+  if (!fmMatch) return {};
+  const fm = {};
+  for (const line of fmMatch[1].split('\n')) {
+    const kv = line.match(/^(\w+)\s*:\s*(.+)/);
+    if (kv) fm[kv[1].trim()] = kv[2].trim();
+  }
+  return fm;
+}
+
 function classifyMemoryFile(filename, content) {
+  // Prefer frontmatter type if present
+  const fm = parseMemoryFrontmatter(content);
+  if (fm.type && ['user', 'feedback', 'project', 'reference'].includes(fm.type)) return fm.type;
+  // Fallback heuristic
   const lower = (filename + ' ' + content).toLowerCase();
   if (lower.includes('user preference') || lower.includes('user pref')) return 'user';
   if (lower.includes('feedback') || lower.includes('coach')) return 'feedback';
@@ -2376,15 +2442,17 @@ function classifyMemoryFile(filename, content) {
 app.get('/api/memories', (req, res) => {
   try {
     const indexContent = parseMemoryIndex();
-    const files = fs.readdirSync(MEMORY_DIR).filter(f => f.endsWith('.md'));
+    const files = fs.readdirSync(MEMORY_DIR).filter(f => f.endsWith('.md') && f !== 'MEMORY.md');
     const memories = files.map(filename => {
       const filePath = path.join(MEMORY_DIR, filename);
       const content = fs.readFileSync(filePath, 'utf-8');
       const stat = fs.statSync(filePath);
+      const fm = parseMemoryFrontmatter(content);
       const lines = content.split('\n').filter(l => l.trim());
       const firstHeading = lines.find(l => l.startsWith('#'));
-      const name = firstHeading ? firstHeading.replace(/^#+\s*/, '') : filename.replace('.md', '');
-      const preview = lines.filter(l => !l.startsWith('#')).slice(0, 3).join(' ').slice(0, 200);
+      const name = fm.name || (firstHeading ? firstHeading.replace(/^#+\s*/, '') : filename.replace('.md', ''));
+      const body = content.replace(/^---\n[\s\S]*?\n---\n?/, '').trim();
+      const preview = body.split('\n').filter(l => l.trim() && !l.startsWith('#')).slice(0, 3).join(' ').slice(0, 200);
       const type = classifyMemoryFile(filename, content);
       return {
         filename,

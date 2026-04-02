@@ -864,6 +864,7 @@ app.post('/api/config/reauth/:server', (req, res) => {
 // ── Database queries: pgproxy (local dev) + Redshift Data API (ECS fallback) ──
 const { Pool } = require('pg');
 const { RedshiftDataClient, ExecuteStatementCommand, DescribeStatementCommand, GetStatementResultCommand } = require('@aws-sdk/client-redshift-data');
+const { STSClient, AssumeRoleCommand } = require('@aws-sdk/client-sts');
 
 // pgproxy config (works on dev laptops with cmtaws sso login)
 const PGPROXY_HOST = process.env.PGPROXY_HOST || '127.0.0.1';
@@ -872,11 +873,41 @@ const PGPROXY_USER = process.env.PGPROXY_USER || 'bmusco@cmtelematics.com';
 const PGPROXY_PASSWORD = process.env.PGPROXY_PASSWORD || 'magic';
 const DEFAULT_DATABASE = process.env.DEFAULT_DATABASE || 'prod_redshift';
 
-// Redshift Data API config (works in ECS with task IAM role, no tunneling needed)
-const REDSHIFT_CLUSTER = process.env.REDSHIFT_CLUSTER || 'cmt-prod-analytics';
+// Redshift Serverless Data API config (prod account, cross-account from ECS)
+const REDSHIFT_WORKGROUP = process.env.REDSHIFT_WORKGROUP || 'prod-research';
 const REDSHIFT_DATABASE = process.env.REDSHIFT_DATABASE || 'prod_vtrack';
-const REDSHIFT_DB_USER = process.env.REDSHIFT_DB_USER || 'bmusco@cmtelematics.com';
-const redshiftData = new RedshiftDataClient({ region: process.env.REDSHIFT_REGION || 'us-east-1' });
+const REDSHIFT_REGION = process.env.REDSHIFT_REGION || 'us-west-2';
+const REDSHIFT_CROSS_ACCOUNT_ROLE = process.env.REDSHIFT_CROSS_ACCOUNT_ROLE || 'arn:aws:iam::062438643287:role/claudio-redshift-query';
+
+// Create a Redshift Data API client with cross-account credentials
+const stsClient = new STSClient({ region: REDSHIFT_REGION });
+let redshiftDataClient = null;
+let redshiftCredentialsExpiry = 0;
+
+async function getRedshiftClient() {
+  // Re-use client if credentials are still valid (refresh 5 min before expiry)
+  if (redshiftDataClient && Date.now() < redshiftCredentialsExpiry - 300000) {
+    return redshiftDataClient;
+  }
+  console.log('[DB] Assuming cross-account role for Redshift Data API...');
+  const assumeResp = await stsClient.send(new AssumeRoleCommand({
+    RoleArn: REDSHIFT_CROSS_ACCOUNT_ROLE,
+    RoleSessionName: 'claudio-redshift',
+    DurationSeconds: 3600,
+  }));
+  const creds = assumeResp.Credentials;
+  redshiftDataClient = new RedshiftDataClient({
+    region: REDSHIFT_REGION,
+    credentials: {
+      accessKeyId: creds.AccessKeyId,
+      secretAccessKey: creds.SecretAccessKey,
+      sessionToken: creds.SessionToken,
+    },
+  });
+  redshiftCredentialsExpiry = creds.Expiration.getTime();
+  console.log('[DB] Redshift Data API client ready (expires', creds.Expiration.toISOString(), ')');
+  return redshiftDataClient;
+}
 
 // Detect pgproxy availability at startup — if unreachable, use Redshift Data API
 let pgproxyAvailable = null; // null = not checked yet
@@ -943,19 +974,19 @@ function isAuroraQuery(database) {
   return database && database.includes('clone');
 }
 
-// Redshift Data API executor (ECS fallback)
+// Redshift Serverless Data API executor (ECS fallback, cross-account)
 async function executeRedshiftDataApi(sql) {
-  const execResp = await redshiftData.send(new ExecuteStatementCommand({
-    ClusterIdentifier: REDSHIFT_CLUSTER,
+  const client = await getRedshiftClient();
+  const execResp = await client.send(new ExecuteStatementCommand({
+    WorkgroupName: REDSHIFT_WORKGROUP,
     Database: REDSHIFT_DATABASE,
-    DbUser: REDSHIFT_DB_USER,
     Sql: sql,
   }));
 
   let status = 'SUBMITTED', attempts = 0;
   while (status !== 'FINISHED' && status !== 'FAILED' && status !== 'ABORTED' && attempts < 60) {
     await new Promise(r => setTimeout(r, attempts < 5 ? 500 : 2000));
-    const desc = await redshiftData.send(new DescribeStatementCommand({ Id: execResp.Id }));
+    const desc = await client.send(new DescribeStatementCommand({ Id: execResp.Id }));
     status = desc.Status;
     if (status === 'FAILED') throw new Error(desc.Error || 'Query failed');
     if (status === 'ABORTED') throw new Error('Query aborted');
@@ -963,7 +994,7 @@ async function executeRedshiftDataApi(sql) {
   }
   if (status !== 'FINISHED') throw new Error('Query timeout after 120s');
 
-  const result = await redshiftData.send(new GetStatementResultCommand({ Id: execResp.Id }));
+  const result = await client.send(new GetStatementResultCommand({ Id: execResp.Id }));
   const fields = (result.ColumnMetadata || []).map(c => c.name);
   const rows = (result.Records || []).map(record =>
     Object.fromEntries(fields.map((f, i) => [f, record[i].stringValue ?? record[i].longValue ?? record[i].doubleValue ?? record[i].booleanValue ?? null]))

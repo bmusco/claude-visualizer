@@ -2157,13 +2157,19 @@ wss.on('connection', (ws, req) => {
               } catch (err) {
                 console.error(`[SQL-EXEC] Attempt ${attempt} error: ${err.message}`);
 
-                // Don't retry connection/auth errors — only retry SQL errors
-                const isConnectionError = /ECONNREFUSED|ETIMEDOUT|active profiles|sso login|DB_CREDENTIALS_|credential|ENOTFOUND|connect\b/i.test(err.message);
-                if (isConnectionError) {
+                // Don't retry hard connection/auth errors — bail immediately
+                const isHardError = /ECONNREFUSED|ETIMEDOUT|active profiles|sso login|DB_CREDENTIALS_|ENOTFOUND/i.test(err.message);
+                if (isHardError) {
                   const errText = `\n\n**Database connection error:** ${err.message}\n`;
                   output += errText;
                   ws.send(JSON.stringify({ action: 'chat-chunk', text: errText }));
                   break;
+                }
+
+                // Aurora unavailable — tell Claude to rewrite for Redshift instead
+                const isAuroraUnavailable = /Aurora queries.*require pgproxy/i.test(err.message);
+                if (isAuroraUnavailable) {
+                  db = DEFAULT_DATABASE; // switch to Redshift for retries
                 }
 
                 errorHistory.push({ sql: currentSql, error: err.message });
@@ -2171,14 +2177,33 @@ wss.on('connection', (ws, req) => {
                 if (attempt < MAX_RETRIES) {
                   ws.send(JSON.stringify({ action: 'chat-chunk', text: `\n\n**Query error:** ${err.message}\nRetrying (${attempt + 1}/${MAX_RETRIES})...\n` }));
 
-                  const retryPrompt = `You are a SQL expert for CMT databases. Fix this query. Output ONLY a corrected \`\`\`sql code block — no explanation.
+                  let retryPrompt;
+                  if (isAuroraUnavailable) {
+                    retryPrompt = `You are a SQL expert for CMT databases. The Aurora database (prod_clone) is NOT available in this environment. You MUST rewrite this query to use ONLY Redshift analytics tables.
+
+Original query that failed (uses Aurora tables like fleets_fleet, companies, vehicles_v2, etc.):
+${currentSql}
+
+IMPORTANT: Aurora tables (fleets_fleet, companies, companies_apps, teams_team, app_users, vehicles_v2, portal_company_config) are NOT accessible. You must find the data using Redshift analytics tables only.
+
+Known Redshift tables and patterns:
+- triplog_trips: trip data with fleet_id, mileage_est_km, etc.
+- app_user_fleet_scores_history: fleet scores with fleet_id
+- tag_status_latest: device/tag status
+- For fleet info, you may need to query: SELECT * FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') LIMIT 50
+- Try discovering available tables first if needed
+
+Output ONLY a corrected \`\`\`sql code block — no explanation. If the data truly cannot be found in Redshift, output a query that discovers what tables ARE available.`;
+                  } else {
+                    retryPrompt = `You are a SQL expert for CMT databases. Fix this query. Output ONLY a corrected \`\`\`sql code block — no explanation.
 
 Database: ${db} (${db.includes('clone') ? 'Aurora/Postgres' : 'Redshift'})
-${db.includes('clone') ? 'Key tables: companies (companyid, name), fleets_fleet (id, name, viewing_company_id, app_id, deleted), companies_apps (id, company_id), teams_team (id, name, fleet_id, viewing_company_id)' : 'Schema: analytics.*'}
+${db.includes('clone') ? 'Key tables: companies (companyid, name), fleets_fleet (id, name, viewing_company_id, app_id, deleted), companies_apps (id, company_id), teams_team (id, name, fleet_id, viewing_company_id)' : 'Schema: Redshift analytics'}
 
 ${errorHistory.map((e, i) => `Attempt ${i + 1}:\nSQL: ${e.sql}\nError: ${e.error}`).join('\n\n')}
 
 Fix the latest error. If a table/column doesn't exist, try discovering it with: SELECT * FROM <table> LIMIT 1`;
+                  }
 
                   const retryResult = spawnSync(CLAUDE_CLI, ['-p', '--output-format', 'text', '--max-turns', '1', retryPrompt], {
                     encoding: 'utf-8',

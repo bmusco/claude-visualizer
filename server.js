@@ -1985,7 +1985,7 @@ wss.on('connection', (ws, req) => {
               if (!sql._retried) {
                 console.log(`[SQL-EXEC] Retrying with error context...`);
                 ws.send(JSON.stringify({ action: 'chat-chunk', text: '\n\nRetrying with corrected query...\n' }));
-                const retryPrompt = `The SQL query failed with this error: ${err.message}\n\nFailed query:\n\`\`\`sql\n${sql}\n\`\`\`\n\nFix the query and output a corrected \`\`\`sql block. If the column doesn't exist, try SELECT * FROM the table LIMIT 1 first to discover the correct column names.`;
+                const retryPrompt = `You are a SQL assistant. A query failed. Output ONLY a corrected SQL query inside a \`\`\`sql code block. No explanation, no prose — just the fixed SQL.\n\nError: ${err.message}\n\nFailed query:\n\`\`\`sql\n${sql}\n\`\`\`\n\nIf a column doesn't exist, first output:\n\`\`\`sql\nSELECT * FROM ${sql.match(/FROM\s+(\w+)/i)?.[1] || 'the_table'} LIMIT 1\n\`\`\`\nto discover correct column names. Then output the fixed query.`;
                 const retryResult = spawnSync(CLAUDE_CLI, ['-p', '--output-format', 'text', '--max-turns', '1', retryPrompt], {
                   encoding: 'utf-8',
                   timeout: 30000,

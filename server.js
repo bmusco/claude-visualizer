@@ -2226,13 +2226,14 @@ Fix the latest error. If a table/column doesn't exist, try discovering it with: 
                     cwd: USER_HOME
                   });
                   const retryOutput = (retryResult.stdout || '').trim();
-                  const retryMatch = retryOutput.match(/```sql\n([\s\S]*?)```/);
+                  // Try multiple patterns to extract SQL
+                  const retryMatch = retryOutput.match(/```sql\n([\s\S]*?)```/) || retryOutput.match(/```\n?(SELECT[\s\S]*?)```/i) || retryOutput.match(/(SELECT\b[\s\S]*?;)\s*$/im);
                   if (retryMatch && /^\s*(SELECT|WITH)\b/i.test(retryMatch[1].trim())) {
                     currentSql = retryMatch[1].trim();
                   } else {
-                    // Claude didn't produce valid SQL, stop retrying
-                    ws.send(JSON.stringify({ action: 'chat-chunk', text: `\n**Could not auto-fix query after ${attempt + 1} attempts.**\n` }));
-                    break;
+                    // Claude didn't produce valid SQL — add to error history and keep trying
+                    console.log(`[SQL-EXEC] Retry ${attempt} didn't produce SQL: ${retryOutput.slice(0, 200)}`);
+                    errorHistory.push({ sql: '(no SQL produced)', error: `Claude responded but did not output a SQL query. Response: ${retryOutput.slice(0, 300)}` });
                   }
                 } else {
                   const errText = `\n\n**Query failed after ${MAX_RETRIES} retries:** ${err.message}\n`;

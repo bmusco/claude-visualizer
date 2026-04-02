@@ -2156,6 +2156,16 @@ wss.on('connection', (ws, req) => {
                 succeeded = true;
               } catch (err) {
                 console.error(`[SQL-EXEC] Attempt ${attempt} error: ${err.message}`);
+
+                // Don't retry connection/auth errors — only retry SQL errors
+                const isConnectionError = /ECONNREFUSED|ETIMEDOUT|active profiles|sso login|DB_CREDENTIALS_|credential|ENOTFOUND|connect\b/i.test(err.message);
+                if (isConnectionError) {
+                  const errText = `\n\n**Database connection error:** ${err.message}\n`;
+                  output += errText;
+                  ws.send(JSON.stringify({ action: 'chat-chunk', text: errText }));
+                  break;
+                }
+
                 errorHistory.push({ sql: currentSql, error: err.message });
 
                 if (attempt < MAX_RETRIES) {

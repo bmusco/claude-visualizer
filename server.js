@@ -2249,10 +2249,9 @@ wss.on('connection', (ws, req) => {
                 console.log(`[SQL-EXEC] Success: ${result.rows.length} rows, ${duration}ms`);
                 const fields = result.fields;
                 let table = '| ' + fields.join(' | ') + ' |\n| ' + fields.map(() => '---').join(' | ') + ' |\n';
-                for (const row of result.rows.slice(0, 50)) {
+                for (const row of result.rows) {
                   table += '| ' + fields.map(f => String(row[f] ?? '')).join(' | ') + ' |\n';
                 }
-                if (result.rows.length > 50) table += `\n*...and ${result.rows.length - 50} more rows*\n`;
                 succeeded = true;
                 isDiscovery = /\bpg_tables\b|\binformation_schema\b|\bpg_columns\b|\bsvv_tables\b|\bsvv_columns\b|\bSHOW\s/i.test(currentSql);
                 if (isDiscovery) {

@@ -429,7 +429,8 @@ function quickImportDbCredentials(btn) {
     .then(data => {
       if (data.ok) {
         if (statusMsg) { statusMsg.textContent = 'Credentials imported successfully!'; statusMsg.className = 'settings-status-msg ok'; }
-        textarea.value = '';
+        textarea.value = '*** credentials saved ***'
+        textarea.style.color = '#666';
         checkDbCredentialStatus();
         dismissDbBanner();
       } else {

@@ -2258,7 +2258,7 @@ wss.on('connection', (ws, req) => {
               ws.send(JSON.stringify({ action: 'chat-status', text: succeeded ? 'Summarizing results...' : 'Fixing query...' }));
 
               const resumeResult = await new Promise((resolve) => {
-                const args = ['-p', '--output-format', 'stream-json', '--permission-mode', 'bypassPermissions', '--resume', sid];
+                const args = ['-p', '--verbose', '--output-format', 'stream-json', '--permission-mode', 'bypassPermissions', '--resume', sid];
                 const proc = spawn(CLAUDE_CLI, args, {
                   env: { ...process.env, HOME: USER_HOME, CLAUDEIO_SESSION: '1' },
                   cwd: __dirname,

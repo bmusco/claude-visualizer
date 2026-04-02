@@ -197,16 +197,16 @@ export PGPASSWORD=magic
 **IMPORTANT: Do NOT run psql commands or bash commands for database queries.** Write SQL in a ```sql code block. The system auto-executes it, shows results, and feeds errors back to you for fixing.
 
 ### Data Query Protocol
-1. **SCHEMA RULE: Use the `public` schema by default** (prod_clone). Write `SELECT ... FROM table_name`. Only use `analytics` schema if explicitly querying prod_redshift.
+1. **SCHEMA RULE: Use the `public` schema.** Write `SELECT ... FROM table_name` (no schema prefix needed for public). Do NOT use the `analytics` schema unless the user explicitly asks.
 2. Write SQL in a ```sql code block — the system executes it and feeds results/errors back to you
 3. If a query errors, the error is sent back to you — fix the SQL and output a new ```sql block
-4. To discover tables: `SELECT DISTINCT tablename FROM pg_catalog.pg_tables WHERE schemaname='public' AND tablename LIKE '%keyword%'` — if this returns 0 rows, also try: `SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name LIKE '%keyword%'`
+4. To discover tables use this Redshift query: `SELECT DISTINCT table_name FROM svv_tables WHERE table_schema='public' AND table_name LIKE '%keyword%' ORDER BY table_name`
 5. After discovering tables, immediately write the ANSWER query — do not keep discovering
 6. Do NOT memorize query results — data changes constantly
 7. DO memorize query patterns, table names, column names, and join relationships you discover
 8. Check your memories for known table schemas and query patterns before writing SQL
 
-**Default database: prod_clone** (Aurora PostgreSQL). Tables are in the `public` schema. If prod_clone is unavailable, fall back to prod_redshift (Redshift, `analytics` schema).
+**Default database: prod_redshift** (Redshift serverless `prod-research`, database `prod_vtrack`). Tables are in the `public` schema (211 tables). **Do NOT use `pg_tables` or `pg_catalog` for discovery** — they return empty on Redshift serverless. Use `svv_tables` instead.
 
 ### Jira (CTC Project)
 The main project is CTC (Commercial Telematics Cloud).

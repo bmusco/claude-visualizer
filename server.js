@@ -918,7 +918,7 @@ const PGPROXY_HOST = process.env.PGPROXY_HOST || '127.0.0.1';
 const PGPROXY_PORT = parseInt(process.env.PGPROXY_PORT || '13626');
 const PGPROXY_USER = process.env.PGPROXY_USER || 'bmusco@cmtelematics.com';
 const PGPROXY_PASSWORD = process.env.PGPROXY_PASSWORD || 'magic';
-const DEFAULT_DATABASE = process.env.DEFAULT_DATABASE || 'prod_clone';
+const DEFAULT_DATABASE = process.env.DEFAULT_DATABASE || 'prod_redshift';
 
 // Redshift Serverless Data API config (prod — uses credentials from UI)
 const REDSHIFT_WORKGROUP = process.env.REDSHIFT_WORKGROUP || 'prod-research';
@@ -2246,7 +2246,7 @@ wss.on('connection', (ws, req) => {
                 }
                 if (result.rows.length > 50) table += `\n*...and ${result.rows.length - 50} more rows*\n`;
                 succeeded = true;
-                isDiscovery = /\bpg_tables\b|\binformation_schema\b|\bpg_columns\b|\bSHOW\s/i.test(currentSql);
+                isDiscovery = /\bpg_tables\b|\binformation_schema\b|\bpg_columns\b|\bsvv_tables\b|\bsvv_columns\b|\bSHOW\s/i.test(currentSql);
                 if (isDiscovery) {
                   safeSend({ action: 'chat-status', text: `Found ${result.rows.length} tables, writing query...` });
                   feedbackMsg = `Discovery query returned ${result.rows.length} rows (${duration}ms):\n\n${table}\n\nNow use these table/column names to write the actual data query that answers the user's question: "${userMessage}". Output a new \`\`\`sql block.`;

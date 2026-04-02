@@ -2229,7 +2229,7 @@ wss.on('connection', (ws, req) => {
             let lastResultTable = null;
             let lastResultMeta = null;
             let discoveryCount = 0;
-            const MAX_DISCOVERY = 5; // Max discovery queries before forcing a data query
+            const MAX_DISCOVERY = 50; // No practical limit — let Claude explore freely
 
             safeSend({ action: 'chat-status', text: 'Querying database...' });
 

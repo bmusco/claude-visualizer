@@ -208,7 +208,7 @@ export PGPASSWORD=magic
    - If a query errors, fix it and retry — don't go back to discovery
 6. Do NOT memorize query results — data changes constantly
 7. DO memorize query patterns, table names, column names, and join relationships you discover
-8. Check your memories for known table schemas and query patterns before writing SQL
+8. **BEFORE writing any SQL, ALWAYS check your memories first** for known table schemas, column names, and query patterns. Your memories contain a schema registry — use it to avoid unnecessary discovery queries.
 
 **Default database: prod_redshift** (Redshift serverless `prod-research`, database `prod_vtrack`). Tables are in the `public` schema (211 tables). **Do NOT use `pg_tables` or `pg_catalog` for discovery** — they return empty on Redshift serverless. Use `svv_tables` instead.
 

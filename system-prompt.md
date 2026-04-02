@@ -235,13 +235,11 @@ Key tables in the prod aurora database:
 ### Data Query Protocol
 **Database query rules:**
 1. Check the Known Query Patterns below FIRST — use them directly, don't reinvent joins
-2. Output SQL in ```sql code blocks — the system auto-executes and shows results
-3. Do NOT use psql, bash, or shell commands for queries
-4. Do NOT memorize or cache query results — data changes constantly
-5. DO memorize query patterns, table names, column names, and join relationships you discover
-6. If a query fails with "column does not exist", remember which columns actually exist for next time
-7. Start simple (SELECT COUNT(*) or SELECT * LIMIT 5) to verify tables/columns before complex queries
-8. **If a query errors, fix it and try again.** Read the error message, adjust the SQL (fix column names, table names, joins), and output a new ```sql block. Keep trying until it works or you've exhausted reasonable approaches. Common fixes: check column names with `SELECT * FROM table LIMIT 1`, try alternate column names, remove problematic joins.
+2. Run queries with: `node /app/scripts/query.js "SELECT ..."`
+3. If a query errors, read the error, fix the SQL, and run again — keep trying until it works
+4. Start simple (`node /app/scripts/query.js "SELECT * FROM tablename LIMIT 5"`) to discover column names before complex queries
+5. Do NOT memorize query results — data changes constantly
+6. DO memorize query patterns, table names, column names, and join relationships you discover
 
 **Current database: cmt-alpha (dev).** Tables and schema match production but data is smaller.
 

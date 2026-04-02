@@ -201,7 +201,11 @@ export PGPASSWORD=magic
 2. Write SQL in a ```sql code block — the system executes it and feeds results/errors back to you
 3. If a query errors, the error is sent back to you — fix the SQL and output a new ```sql block
 4. To discover tables use this Redshift query: `SELECT DISTINCT table_name FROM svv_tables WHERE table_schema='public' AND table_name LIKE '%keyword%' ORDER BY table_name`
-5. **After discovering tables, IMMEDIATELY write the data query** — do NOT inspect columns first. Use `SELECT *` with `LIMIT 5` if you need to see what columns exist. You have a maximum of 3 discovery queries before you must write the answer query.
+5. **Be strategic with discovery.** You have many iterations but use them wisely:
+   - First: find relevant tables with `svv_tables` (1 query)
+   - Then: `SELECT * FROM table LIMIT 5` to see columns and sample data (1 query per table)
+   - Then: write the answer query — don't keep exploring if you have enough info
+   - If a query errors, fix it and retry — don't go back to discovery
 6. Do NOT memorize query results — data changes constantly
 7. DO memorize query patterns, table names, column names, and join relationships you discover
 8. Check your memories for known table schemas and query patterns before writing SQL

@@ -2219,14 +2219,14 @@ wss.on('connection', (ws, req) => {
 
           for (const sql of sqlBlocks) {
             let db = detectDatabase(sql);
-            const MAX_ITERATIONS = 10;
+            const MAX_ITERATIONS = 50;
             let currentSql = sql;
 
             let lastQuerySql = null;
             let lastResultTable = null;
             let lastResultMeta = null;
             let discoveryCount = 0;
-            const MAX_DISCOVERY = 3; // Max discovery queries before forcing a data query
+            const MAX_DISCOVERY = 5; // Max discovery queries before forcing a data query
 
             safeSend({ action: 'chat-status', text: 'Querying database...' });
 

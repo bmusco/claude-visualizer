@@ -2050,10 +2050,9 @@ wss.on('connection', (ws, req) => {
       const cliArgs = ['-p', '--verbose', '--output-format', 'stream-json', '--include-partial-messages', '--permission-mode', 'bypassPermissions'];
       if (selectedModel) cliArgs.push('--model', selectedModel);
 
-      // DB MCP tool is available via .mcp.json (written at startup)
-      // Quick mode: skip MCP servers (but Claude still connects to .mcp.json servers)
+      // Quick mode: skip MCP servers for faster response
       if (skipMcp) {
-        // Don't use --strict-mcp-config here — we need the claudio-db MCP server
+        // No special handling needed — MCP flags controlled elsewhere
       }
 
       // Warm session: resume previous session for this conversation
@@ -2069,7 +2068,7 @@ wss.on('connection', (ws, req) => {
       // Always pipe prompt via stdin to avoid variadic flag conflicts (--mcp-config eats positional args)
       claude = spawn(CLAUDE_CLI, cliArgs, {
         env: { ...process.env, HOME: USER_HOME, CLAUDEIO_SESSION: '1' },
-        cwd: __dirname, // Use app dir so Claude finds .mcp.json with claudio-db tool
+        cwd: __dirname,
         stdio: ['pipe', 'pipe', 'pipe']
       });
       claude.stdin.write(fullPrompt);
@@ -2197,8 +2196,9 @@ wss.on('connection', (ws, req) => {
       });
 
       claude.on('close', async (code) => {
-        console.log(`[CHAT] Claude process closed with code ${code}, output length: ${output.length}, has sql: ${/```sql/.test(output)}`);
+        console.log(`[CHAT] Claude process closed with code ${code}, output length: ${output.length}, has sql: ${/\`\`\`sql/.test(output)}`);
         chatSessions.delete(ws);
+        const safeSend = (data) => { try { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data)); } catch {} };
 
         // Auto-execute SQL from Claude's response, then resume session with results/errors
         const sqlBlockRegex = /```sql\n([\s\S]*?)```/g;
@@ -2236,17 +2236,24 @@ wss.on('connection', (ws, req) => {
                 if (result.rows.length > 50) table += `\n*...and ${result.rows.length - 50} more rows*\n`;
                 const resultText = `\n\n**Query results** (${result.rows.length} rows, ${duration}ms, ${db}):\n\n${table}`;
                 output += resultText;
-                ws.send(JSON.stringify({ action: 'chat-chunk', text: resultText }));
+                safeSend({ action: 'chat-chunk', text: resultText });
                 succeeded = true;
-                feedbackMsg = `Query on ${db} returned ${result.rows.length} rows (${duration}ms):\n\n${table}\n\nSummarize these results to answer the user's question.`;
+                // Detect discovery queries (table/column listings) vs actual data queries
+                const isDiscovery = /\bpg_tables\b|\binformation_schema\b|\bpg_columns\b|\bSHOW\s/i.test(currentSql);
+                if (isDiscovery) {
+                  feedbackMsg = `Discovery query returned ${result.rows.length} rows (${duration}ms):\n\n${table}\n\nNow use these table/column names to write the actual data query that answers the user's question: "${userMessage}". Output a new \`\`\`sql block.`;
+                  succeeded = false; // Don't break — need Claude to write the real query
+                } else {
+                  feedbackMsg = `Query on ${db} returned ${result.rows.length} rows (${duration}ms):\n\n${table}\n\nSummarize these results to answer the user's question.`;
+                }
               } catch (err) {
                 console.error(`[SQL-EXEC] Iter ${i} error: ${err.message}`);
                 if (/ECONNREFUSED|ETIMEDOUT|DB_CREDENTIALS_|ENOTFOUND/i.test(err.message)) {
-                  ws.send(JSON.stringify({ action: 'chat-chunk', text: `\n\n**Database error:** ${err.message}\n` }));
+                  safeSend({ action: 'chat-chunk', text: `\n\n**Database error:** ${err.message}\n` });
                   break;
                 }
                 if (/Aurora queries.*require pgproxy/i.test(err.message)) db = DEFAULT_DATABASE;
-                ws.send(JSON.stringify({ action: 'chat-chunk', text: `\n\n**Query error:** ${err.message} — retrying...\n` }));
+                safeSend({ action: 'chat-chunk', text: `\n\n**Query error:** ${err.message} — retrying...\n` });
                 feedbackMsg = `Query failed on ${db}.\nSQL: ${currentSql}\nError: ${err.message}\n\nFix the query and output a new \`\`\`sql block. The user asked: "${userMessage}"`;
               }
 
@@ -2255,7 +2262,7 @@ wss.on('connection', (ws, req) => {
               if (!sid || !feedbackMsg) { console.log(`[SQL-EXEC] No session (${sid}) or feedback — stopping`); break; }
 
               console.log(`[SQL-EXEC] Resuming session ${sid} with ${succeeded ? 'results' : 'error'}...`);
-              ws.send(JSON.stringify({ action: 'chat-status', text: succeeded ? 'Summarizing results...' : 'Fixing query...' }));
+              safeSend({ action: 'chat-status', text: succeeded ? 'Summarizing results...' : 'Writing query...' });
 
               const resumeResult = await new Promise((resolve) => {
                 const args = ['-p', '--verbose', '--output-format', 'stream-json', '--permission-mode', 'bypassPermissions', '--resume', sid];
@@ -2279,10 +2286,10 @@ wss.on('connection', (ws, req) => {
                       const et = ev?.type || p.type;
                       if (et === 'content_block_delta') {
                         const delta = ev.delta || {};
-                        if (delta.type === 'text_delta' && delta.text) { text += delta.text; ws.send(JSON.stringify({ action: 'chat-chunk', text: delta.text })); }
-                        else if (delta.type === 'thinking_delta' && delta.thinking) { ws.send(JSON.stringify({ action: 'chat-thinking-delta', text: delta.thinking })); }
+                        if (delta.type === 'text_delta' && delta.text) { text += delta.text; safeSend({ action: 'chat-chunk', text: delta.text }); }
+                        else if (delta.type === 'thinking_delta' && delta.thinking) { safeSend({ action: 'chat-thinking-delta', text: delta.thinking }); }
                       } else if (p.type === 'result' || et === 'result') {
-                        const r = p.result || ev.result; if (r) text = r;
+                        // Don't overwrite text with result — result is plain text without code blocks
                         const newSid = p.session_id || p.sessionId || ev?.session_id;
                         if (newSid) warmSessions.set(convId, { sessionId: newSid, lastUsed: Date.now() });
                       }
@@ -2304,7 +2311,7 @@ wss.on('connection', (ws, req) => {
 
               if (succeeded) break; // Claude summarized — done
               if (resumeResult.sql) { currentSql = resumeResult.sql; } // Loop continues with new SQL
-              else break; // Claude responded without SQL — done
+              else { console.log(`[SQL-EXEC] Claude responded without new SQL — stopping`); break; }
             }
           }
         }
@@ -2318,7 +2325,7 @@ wss.on('connection', (ws, req) => {
           }
           saveChatHistory();
         }
-        try { ws.send(JSON.stringify({ action: 'chat-done', text: output })); } catch {}
+        safeSend({ action: 'chat-done', text: output });
       });
 
       claude.on('error', (err) => {

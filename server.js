@@ -1925,9 +1925,17 @@ wss.on('connection', (ws, req) => {
       claude.on('close', async (code) => {
         chatSessions.delete(ws);
 
-        // SQL auto-execute disabled — Claude uses node /app/scripts/query.js natively
+        // Fallback: auto-execute SQL code blocks if Claude writes them instead of using query.js
+        const sqlBlockRegex = /```sql\n([\s\S]*?)```/g;
+        let sqlMatch;
         const sqlBlocks = [];
-        if (false && sqlBlocks.length > 0) {
+        while ((sqlMatch = sqlBlockRegex.exec(output)) !== null) {
+          const sql = sqlMatch[1].trim();
+          if (/^\s*SELECT\b/i.test(sql) || /^\s*WITH\b/i.test(sql)) {
+            sqlBlocks.push(sql);
+          }
+        }
+        if (sqlBlocks.length > 0) {
           for (const sql of sqlBlocks) {
             try {
               const start = Date.now();

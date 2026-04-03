@@ -1364,7 +1364,7 @@ function createPanelElement(panel, index) {
   } else if (panel.type && panel.type.startsWith('chart-')) {
     const chartType = panel.type.replace('chart-', '');
     body.innerHTML = '<div class="chart-container"><canvas></canvas></div>';
-    setTimeout(() => renderChart(body.querySelector('canvas'), chartType, panel.content), 50);
+    setTimeout(() => renderChart(body.querySelector('canvas'), chartType, panel.content, panel._chartMeta), 50);
   }
 
   return el;
@@ -1669,11 +1669,12 @@ function convertToEmbedUrl(url, mimeType) {
   return url;
 }
 
-function renderChart(canvas, type, content) {
+function renderChart(canvas, type, content, meta) {
   if (!canvas) return;
   let data;
   try {
-    data = typeof content === 'string' ? JSON.parse(content) : content;
+    const parsed = typeof content === 'string' ? JSON.parse(content) : content;
+    data = parsed;
   } catch (e) {
     canvas.parentElement.innerHTML = `<p style="color: var(--danger)">Invalid chart JSON: ${e.message}</p>`;
     return;
@@ -1683,21 +1684,104 @@ function renderChart(canvas, type, content) {
   const existing = Chart.getChart(canvas);
   if (existing) existing.destroy();
 
-  new Chart(canvas, {
-    type: type,
-    data: data,
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: { labels: { color: '#5f6672' } }
-      },
-      scales: type !== 'pie' ? {
-        x: { ticks: { color: '#5f6672' }, grid: { color: '#e2e5ea' } },
-        y: { ticks: { color: '#5f6672' }, grid: { color: '#e2e5ea' } }
-      } : undefined
+  const isHorizontal = meta?.horizontal;
+  const isPie = type === 'pie' || type === 'doughnut';
+  const isLine = type === 'line';
+  const rowCount = meta?.rowCount || (data.labels?.length || 0);
+
+  // Format large numbers for axis ticks
+  function formatNum(v) {
+    if (typeof v !== 'number') return v;
+    const abs = Math.abs(v);
+    if (abs >= 1e9) return (v / 1e9).toFixed(1).replace(/\.0$/, '') + 'B';
+    if (abs >= 1e6) return (v / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+    if (abs >= 1e4) return (v / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
+    if (abs < 1 && abs > 0) return v.toFixed(2);
+    return v.toLocaleString();
+  }
+
+  // Truncate long labels
+  function truncLabel(label, max) {
+    if (!label || label.length <= max) return label;
+    return label.slice(0, max - 1) + '…';
+  }
+
+  // Truncate labels for display (keep full in tooltip)
+  const fullLabels = data.labels || [];
+  const maxLabelLen = isHorizontal ? 30 : (rowCount > 15 ? 12 : 20);
+  data.labels = fullLabels.map(l => truncLabel(String(l), maxLabelLen));
+
+  // Auto-size container for many labels or horizontal bar
+  const container = canvas.parentElement;
+  if (container) {
+    if (isHorizontal && rowCount > 10) {
+      container.style.height = Math.max(350, rowCount * 28) + 'px';
+    } else if (!isPie && rowCount > 20) {
+      container.style.height = Math.max(350, 350 + (rowCount - 20) * 5) + 'px';
     }
-  });
+  }
+
+  // Build chart options
+  const opts = {
+    responsive: true,
+    maintainAspectRatio: false,
+    indexAxis: isHorizontal ? 'y' : 'x',
+    plugins: {
+      legend: {
+        display: (data.datasets?.length > 1) || isPie,
+        labels: { color: '#5f6672', font: { size: 12 }, padding: 16, usePointStyle: true }
+      },
+      tooltip: {
+        callbacks: {
+          title: (items) => items.length ? fullLabels[items[0].dataIndex] || items[0].label : '',
+          label: (ctx) => {
+            const label = ctx.dataset.label || '';
+            const val = ctx.parsed?.y ?? ctx.parsed ?? ctx.raw;
+            const num = typeof val === 'number' ? formatNum(val) : val;
+            if (isPie) {
+              const total = ctx.dataset.data.reduce((s, v) => s + v, 0);
+              const pct = total > 0 ? ((ctx.raw / total) * 100).toFixed(1) + '%' : '';
+              return `${label || fullLabels[ctx.dataIndex]}: ${num} (${pct})`;
+            }
+            return label ? `${label}: ${num}` : num;
+          }
+        }
+      },
+      // Data labels for pie charts
+      ...(isPie ? {
+        datalabels: undefined // we'll use the built-in tooltip instead — cleaner
+      } : {})
+    }
+  };
+
+  // Scale configuration for non-pie charts
+  if (!isPie) {
+    const valueAxis = isHorizontal ? 'x' : 'y';
+    const labelAxis = isHorizontal ? 'y' : 'x';
+    opts.scales = {
+      [valueAxis]: {
+        ticks: {
+          color: '#5f6672',
+          callback: function(v) { return formatNum(v); },
+          font: { size: 11 }
+        },
+        grid: { color: '#e2e5ea' },
+        beginAtZero: true
+      },
+      [labelAxis]: {
+        ticks: {
+          color: '#5f6672',
+          font: { size: rowCount > 20 ? 10 : 11 },
+          maxRotation: isHorizontal ? 0 : (rowCount > 12 ? 45 : 0),
+          autoSkip: true,
+          autoSkipPadding: 8
+        },
+        grid: { display: isHorizontal }
+      }
+    };
+  }
+
+  new Chart(canvas, { type: isHorizontal ? 'bar' : type, data, options: opts });
 }
 
 function removePanel(id) {
@@ -1916,7 +2000,7 @@ function renderSlide() {
   } else if (panel.type && panel.type.startsWith('chart-')) {
     const chartType = panel.type.replace('chart-', '');
     content.innerHTML = '<div style="height:70vh;"><canvas></canvas></div>';
-    setTimeout(() => renderChart(content.querySelector('canvas'), chartType, panel.content), 50);
+    setTimeout(() => renderChart(content.querySelector('canvas'), chartType, panel.content, panel._chartMeta), 50);
   }
 }
 

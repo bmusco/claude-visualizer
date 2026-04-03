@@ -1298,6 +1298,144 @@ function isAuroraQuery(database) {
   return database && database.includes('clone');
 }
 
+// ── Smart chart builder ─────────────────────────────────────────
+// Analyzes query results and builds optimal Chart.js config
+function buildSmartChart(fields, rows, requestedType) {
+  const MAX_LABELS = 30;
+  const DATE_RE = /^\d{4}[-/]\d{2}([-/]\d{2})?/;
+  const MONTH_RE = /^\d{4}[-/]\d{2}$/;
+
+  // Classify columns
+  const labelField = fields[0];
+  const numericFields = [];
+  for (let i = 1; i < fields.length; i++) {
+    const hasNumeric = rows.some(r => {
+      const v = r[fields[i]];
+      return v !== null && v !== undefined && v !== '' && !isNaN(Number(v));
+    });
+    if (hasNumeric) numericFields.push(fields[i]);
+  }
+  if (numericFields.length === 0) {
+    // Fallback: return basic bar with first two columns
+    return { type: requestedType, data: { labels: rows.map(r => String(r[labelField] ?? '')), datasets: [] }, meta: {} };
+  }
+
+  // Detect if label column is a date/time series
+  const sampleLabels = rows.slice(0, 10).map(r => String(r[labelField] ?? ''));
+  const isDateSeries = sampleLabels.filter(l => DATE_RE.test(l)).length > sampleLabels.length * 0.7;
+  const isMonthSeries = isDateSeries && sampleLabels.filter(l => MONTH_RE.test(l)).length > sampleLabels.length * 0.5;
+
+  // Sort rows: dates chronologically, others by first numeric column descending
+  let sorted = [...rows];
+  if (isDateSeries) {
+    sorted.sort((a, b) => new Date(a[labelField]) - new Date(b[labelField]));
+  } else {
+    sorted.sort((a, b) => (Number(b[numericFields[0]]) || 0) - (Number(a[numericFields[0]]) || 0));
+  }
+
+  // Auto-detect best chart type
+  let chartType = requestedType.replace('chart-', '');
+  const meta = {};
+
+  if (chartType === 'bar' || chartType === 'line' || chartType === 'pie') {
+    // Re-evaluate: Claude may have picked wrong type
+    if (isDateSeries && numericFields.length <= 4) {
+      chartType = 'line'; // time series → line
+      meta.dateAxis = true;
+    } else if (!isDateSeries && sorted.length <= 6 && numericFields.length === 1) {
+      // Few categories, single metric → pie works
+      const vals = sorted.map(r => Number(r[numericFields[0]]) || 0);
+      if (vals.every(v => v >= 0)) chartType = 'pie';
+    } else if (!isDateSeries && sorted.length > 6) {
+      chartType = 'bar';
+    }
+  }
+
+  // Check if labels are long (avg > 20 chars) → use horizontal bar
+  const avgLabelLen = sorted.reduce((s, r) => s + String(r[labelField] ?? '').length, 0) / (sorted.length || 1);
+  if (chartType === 'bar' && avgLabelLen > 20) {
+    meta.horizontal = true;
+  }
+
+  // Cap labels — aggregate overflow into "Other" for bar/pie
+  if (sorted.length > MAX_LABELS && chartType !== 'line') {
+    const top = sorted.slice(0, MAX_LABELS - 1);
+    const rest = sorted.slice(MAX_LABELS - 1);
+    const otherRow = { [labelField]: `Other (${rest.length})` };
+    for (const f of numericFields) {
+      otherRow[f] = rest.reduce((s, r) => s + (Number(r[f]) || 0), 0);
+    }
+    sorted = [...top, otherRow];
+    meta.aggregated = rest.length;
+  }
+
+  // Format date labels
+  let labels = sorted.map(r => {
+    const v = String(r[labelField] ?? '');
+    if (isDateSeries) {
+      try {
+        const d = new Date(v);
+        if (!isNaN(d)) {
+          if (isMonthSeries) return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short' });
+          return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' });
+        }
+      } catch {}
+    }
+    return v;
+  });
+
+  // Build datasets with a good color palette
+  const COLORS = [
+    { bg: 'rgba(59, 130, 246, 0.7)', border: 'rgb(59, 130, 246)' },     // blue
+    { bg: 'rgba(16, 185, 129, 0.7)', border: 'rgb(16, 185, 129)' },     // emerald
+    { bg: 'rgba(245, 158, 11, 0.7)', border: 'rgb(245, 158, 11)' },     // amber
+    { bg: 'rgba(239, 68, 68, 0.7)', border: 'rgb(239, 68, 68)' },       // red
+    { bg: 'rgba(139, 92, 246, 0.7)', border: 'rgb(139, 92, 246)' },     // violet
+    { bg: 'rgba(236, 72, 153, 0.7)', border: 'rgb(236, 72, 153)' },     // pink
+    { bg: 'rgba(20, 184, 166, 0.7)', border: 'rgb(20, 184, 166)' },     // teal
+    { bg: 'rgba(251, 146, 60, 0.7)', border: 'rgb(251, 146, 60)' },     // orange
+  ];
+
+  const datasets = numericFields.map((f, i) => {
+    const color = COLORS[i % COLORS.length];
+    const vals = sorted.map(r => {
+      const v = r[f];
+      return typeof v === 'number' ? v : parseFloat(v) || 0;
+    });
+    const ds = { label: f, data: vals };
+    if (chartType === 'pie') {
+      // Pie: each slice gets a different color
+      ds.backgroundColor = vals.map((_, j) => COLORS[j % COLORS.length].bg);
+      ds.borderColor = vals.map((_, j) => COLORS[j % COLORS.length].border);
+      ds.borderWidth = 2;
+    } else if (chartType === 'line') {
+      ds.borderColor = color.border;
+      ds.backgroundColor = color.bg.replace('0.7', '0.1');
+      ds.fill = numericFields.length === 1;
+      ds.tension = 0.3;
+      ds.pointRadius = sorted.length > 50 ? 0 : 3;
+    } else {
+      ds.backgroundColor = color.bg;
+      ds.borderColor = color.border;
+      ds.borderWidth = 1;
+      ds.borderRadius = 3;
+    }
+    return ds;
+  });
+
+  meta.rowCount = sorted.length;
+  meta.numericCols = numericFields.length;
+  meta.chartType = chartType;
+  if (isDateSeries) meta.dateAxis = true;
+  if (meta.horizontal) meta.horizontal = true;
+
+  return {
+    type: 'chart-' + chartType,
+    data: { labels, datasets },
+    meta
+  };
+}
+
 // Redshift Serverless Data API executor (prod, uses stored credentials)
 async function executeRedshiftDataApi(sql) {
   if (!redshiftClient || !dbCredentialsValid()) {
@@ -2686,28 +2824,13 @@ wss.on('connection', (ws, req) => {
                     try {
                       const panelData = JSON.parse(panelMatch[1]);
                       if (panelData.type && panelData.type.startsWith('chart-')) {
-                        // Build Chart.js data from actual query results
-                        const fields = finalResultFields;
-                        // First column = labels, remaining numeric columns = datasets
-                        const labelField = fields[0];
-                        const labels = finalResultRows.map(r => String(r[labelField] ?? ''));
-                        const datasets = [];
-                        for (let fi = 1; fi < fields.length; fi++) {
-                          const vals = finalResultRows.map(r => {
-                            const v = r[fields[fi]];
-                            return typeof v === 'number' ? v : parseFloat(v) || 0;
-                          });
-                          // Only include columns that have at least one non-zero numeric value
-                          if (vals.some(v => v !== 0)) {
-                            datasets.push({ label: fields[fi], data: vals });
-                          }
-                        }
-                        if (datasets.length > 0) {
-                          panelData.content = { labels, datasets };
-                          const newPanel = `<!--PANEL:${JSON.stringify(panelData)}-->`;
-                          summaryText = summaryText.replace(/<!--PANEL:[\s\S]*?-->/, newPanel);
-                          console.log(`[SQL-EXEC] Replaced chart panel data with ${finalResultRows.length} rows of actual query results`);
-                        }
+                        const chartResult = buildSmartChart(finalResultFields, finalResultRows, panelData.type);
+                        panelData.type = chartResult.type;
+                        panelData.content = chartResult.data;
+                        if (chartResult.meta) panelData._chartMeta = chartResult.meta;
+                        const newPanel = `<!--PANEL:${JSON.stringify(panelData)}-->`;
+                        summaryText = summaryText.replace(/<!--PANEL:[\s\S]*?-->/, newPanel);
+                        console.log(`[SQL-EXEC] Replaced chart panel data with ${finalResultRows.length} rows (type: ${chartResult.type}, meta: ${JSON.stringify(chartResult.meta || {})})`);
                       }
                     } catch (e) {
                       console.error(`[SQL-EXEC] Failed to replace chart data: ${e.message}`);

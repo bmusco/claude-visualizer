@@ -1,12 +1,17 @@
 FROM node:20-slim
 
-RUN apt-get update && apt-get install -y curl ca-certificates git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y curl ca-certificates git python3 python3-venv && rm -rf /var/lib/apt/lists/*
+
+# Install uv (Python package manager) system-wide for running Python MCP servers
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
 RUN useradd -m appuser || true
 
 # Install Claude CLI via official installer (as appuser so it lands in ~/.local/bin)
 USER appuser
 RUN curl -fsSL https://claude.ai/install.sh | bash
+# Pre-install mcp-atlassian so uvx doesn't need to download at runtime
+RUN uv tool install mcp-atlassian
 USER root
 
 WORKDIR /app

@@ -12,11 +12,27 @@ if [ -n "$CLAUDE_CONFIG_TAR_B64" ] && [ "$CLAUDE_CONFIG_TAR_B64" != "placeholder
     echo "[entrypoint] MCP credentials found, will be available to Claude CLI"
   fi
 
-  # Copy .mcp.json to app directory if present in config
-  if [ -f "$HOME/.mcp.json" ]; then
-    cp "$HOME/.mcp.json" /app/.mcp.json 2>/dev/null || true
-    echo "[entrypoint] .mcp.json restored"
-  fi
+  # Write canonical .mcp.json with wrapper-based Atlassian config
+  # (overrides whatever was in the tarball to ensure correct MCP server setup)
+  cat > "$HOME/.mcp.json" << 'MCPEOF'
+{
+  "mcpServers": {
+    "google-workspace": {
+      "url": "https://portal.int-tools.cmtelematics.com/google-workspace-mcp/mcp"
+    },
+    "atlassian": {
+      "command": "/app/scripts/atlassian-mcp-wrapper.sh",
+      "args": [],
+      "env": {}
+    },
+    "slack": {
+      "url": "https://portal.int-tools.cmtelematics.com/slack-mcp/mcp"
+    }
+  }
+}
+MCPEOF
+  cp "$HOME/.mcp.json" /app/.mcp.json 2>/dev/null || true
+  echo "[entrypoint] .mcp.json written with Atlassian wrapper config"
 
   # Restore OAuth client registrations
   if [ -f "$HOME/.oauth-clients.json" ]; then
@@ -37,6 +53,29 @@ if [ -n "$CLAUDE_CONFIG_TAR_B64" ] && [ "$CLAUDE_CONFIG_TAR_B64" != "placeholder
     echo "# Claud-io Memory" > "$MEMORY_DIR/MEMORY.md"
     echo "[entrypoint] Memory directory initialized"
   fi
+fi
+
+# Ensure .mcp.json exists even without tarball
+if [ ! -f "$HOME/.mcp.json" ]; then
+  cat > "$HOME/.mcp.json" << 'MCPEOF'
+{
+  "mcpServers": {
+    "google-workspace": {
+      "url": "https://portal.int-tools.cmtelematics.com/google-workspace-mcp/mcp"
+    },
+    "atlassian": {
+      "command": "/app/scripts/atlassian-mcp-wrapper.sh",
+      "args": [],
+      "env": {}
+    },
+    "slack": {
+      "url": "https://portal.int-tools.cmtelematics.com/slack-mcp/mcp"
+    }
+  }
+}
+MCPEOF
+  cp "$HOME/.mcp.json" /app/.mcp.json 2>/dev/null || true
+  echo "[entrypoint] Default .mcp.json written"
 fi
 
 exec "$@"

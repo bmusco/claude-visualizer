@@ -89,9 +89,11 @@ function loadConfig() {
     const modelInfo = (config.model?.available || []).find(m => m.id === currentModel);
     const pillLabel = document.getElementById('model-pill-label');
     if (pillLabel && modelInfo) pillLabel.textContent = modelInfo.label;
-    // Also update settings modal if open
+    // If settings modal is open, update the model selector without re-rendering the whole modal
+    // (re-rendering would reset badge states that loadAtlassianCredentials already set)
     if (document.getElementById('settings-modal')?.classList.contains('active')) {
-      renderSettingsModal();
+      const modelSelect = document.getElementById('settings-model-select');
+      if (modelSelect) modelSelect.value = config.model?.current || '';
     }
   }).catch(() => {});
 }
@@ -137,23 +139,6 @@ function renderSettingsDropdown(config) {
     </div>`).join('')}
   </div>`;
 
-  // Atlassian (API token, not OAuth)
-  if (config.mcpServers.some(s => s.id === 'atlassian')) {
-    html += `<div class="settings-section">
-      <div class="settings-section-title">Atlassian</div>
-      <div class="settings-server-card" id="server-atlassian">
-        <div class="settings-item">
-          <span class="item-label">Jira & Confluence</span>
-          <span class="integration-badge disconnected" id="badge-atlassian">Not Connected</span>
-        </div>
-        <div class="settings-auth-actions">
-          <button class="settings-action-btn" onclick="testMcpConnection('atlassian', this)">Test</button>
-        </div>
-        <div class="settings-status-msg" id="status-atlassian"></div>
-      </div>
-    </div>`;
-  }
-
   dd.innerHTML = html;
 
   // Check per-user OAuth status for each integration
@@ -171,27 +156,15 @@ function testMcpConnection(serverId, btn) {
   fetch(`${API_BASE}/api/config/test/${serverId}`, { method: 'POST', credentials: 'include' })
     .then(r => r.json())
     .then(data => {
-      if (badge) { badge.textContent = data.ok ? 'Connected' : 'Not Connected'; badge.className = 'integration-badge ' + (data.ok ? 'connected' : 'disconnected'); }
-      if (statusMsg) { statusMsg.textContent = data.ok ? '' : 'Authentication required — click Connect to sign in'; statusMsg.className = 'settings-status-msg ' + (data.ok ? 'ok' : 'err'); }
-      // Google/Slack: show Reconnect when connected
-      if (serverId !== 'atlassian' && connectBtn) {
-        connectBtn.textContent = data.ok ? 'Reconnect' : ({ 'google-workspace': 'Connect Google Account', 'slack': 'Connect Slack' }[serverId] || 'Connect');
-      }
-      // Atlassian: hide credential fields when connected
       if (serverId === 'atlassian') {
-        const emailField = document.getElementById('atlassian-email');
-        const tokenField = document.getElementById('atlassian-token');
-        const instrEl = document.querySelector('#server-atlassian .integration-instructions');
-        if (data.ok) {
-          if (emailField) emailField.style.display = 'none';
-          if (tokenField) tokenField.style.display = 'none';
-          if (instrEl) instrEl.style.display = 'none';
-          if (connectBtn) connectBtn.style.display = 'none';
-        } else {
-          if (emailField) emailField.style.display = '';
-          if (tokenField) tokenField.style.display = '';
-          if (instrEl) instrEl.style.display = '';
-          if (connectBtn) connectBtn.style.display = '';
+        // For Atlassian, show Connected/Saved based on test result but don't reset to generic text
+        if (badge) { badge.textContent = data.ok ? 'Connected' : 'Saved'; badge.className = 'integration-badge connected'; }
+        if (statusMsg && data.ok) { statusMsg.textContent = 'Connection verified.'; statusMsg.className = 'settings-status-msg ok'; }
+      } else {
+        if (badge) { badge.textContent = data.ok ? 'Connected' : 'Not Connected'; badge.className = 'integration-badge ' + (data.ok ? 'connected' : 'disconnected'); }
+        if (statusMsg) { statusMsg.textContent = data.ok ? '' : 'Authentication required — click Connect to sign in'; statusMsg.className = 'settings-status-msg ' + (data.ok ? 'ok' : 'err'); }
+        if (connectBtn) {
+          connectBtn.textContent = data.ok ? 'Reconnect' : ({ 'google-workspace': 'Connect Google Account', 'slack': 'Connect Slack' }[serverId] || 'Connect');
         }
       }
       if (btn) { btn.textContent = 'Test'; btn.disabled = false; }
@@ -302,10 +275,19 @@ function checkUserAuthStatus(serverId) {
 
 function saveAtlassianCredentials(btn) {
   const email = document.getElementById('atlassian-email')?.value?.trim();
-  const token = document.getElementById('atlassian-token')?.value?.trim();
+  const tokenField = document.getElementById('atlassian-token');
+  const token = tokenField?.value?.trim();
   const badge = document.getElementById('badge-atlassian');
   const statusMsg = document.getElementById('status-atlassian');
   const disconnectBtn = document.getElementById('disconnect-btn-atlassian');
+
+  // If token is the masked placeholder and wasn't changed, just re-test connection
+  if (tokenField?.dataset.saved === '1' && token === '••••••••••••••••') {
+    if (statusMsg) { statusMsg.textContent = 'Credentials already saved. Testing connection...'; statusMsg.className = 'settings-status-msg'; }
+    if (badge) { badge.textContent = 'Testing...'; badge.className = 'integration-badge checking'; }
+    testMcpConnection('atlassian', null);
+    return;
+  }
 
   if (!email || !token) {
     if (statusMsg) { statusMsg.textContent = 'Please enter both email and API token.'; statusMsg.className = 'settings-status-msg err'; }
@@ -324,12 +306,16 @@ function saveAtlassianCredentials(btn) {
     .then(r => r.json())
     .then(data => {
       if (data.ok) {
-        // Test the connection
-        testMcpConnection('atlassian', null);
-        btn.textContent = 'Save Atlassian Credentials';
+        if (badge) { badge.textContent = 'Saved'; badge.className = 'integration-badge connected'; }
+        if (statusMsg) { statusMsg.textContent = 'Credentials saved.'; statusMsg.className = 'settings-status-msg ok'; }
+        btn.textContent = 'Update Atlassian Credentials';
         btn.disabled = false;
+        // Mask the token field now that it's saved
+        const tokenField = document.getElementById('atlassian-token');
+        if (tokenField) { tokenField.value = '••••••••••••••••'; tokenField.dataset.saved = '1'; }
+        testMcpConnection('atlassian', null);
       } else {
-        if (badge) { badge.textContent = 'Not Connected'; badge.className = 'integration-badge disconnected'; }
+        if (badge) { badge.textContent = 'Error'; badge.className = 'integration-badge disconnected'; }
         if (statusMsg) { statusMsg.textContent = data.error || 'Failed to save credentials'; statusMsg.className = 'settings-status-msg err'; }
         btn.textContent = 'Save Atlassian Credentials';
         btn.disabled = false;
@@ -4627,48 +4613,56 @@ document.addEventListener('click', (e) => {
 });
 
 // ── Settings Modal ───────────────────────────────────────────────
+function loadAtlassianCredentials() {
+  fetch(`${API_BASE}/api/integrations/atlassian/credentials`)
+    .then(r => r.json())
+    .then(data => {
+      const emailField = document.getElementById('atlassian-email');
+      const tokenField = document.getElementById('atlassian-token');
+      const badge = document.getElementById('badge-atlassian');
+      const btn = document.getElementById('connect-btn-atlassian');
+      if (data.ok && data.hasToken) {
+        if (emailField && data.email) emailField.value = data.email;
+        if (tokenField) { tokenField.value = '••••••••••••••••'; tokenField.dataset.saved = '1'; }
+        if (badge) { badge.textContent = 'Saved'; badge.className = 'integration-badge connected'; }
+        if (btn) btn.textContent = 'Update Atlassian Credentials';
+      } else {
+        if (badge) { badge.textContent = 'Not Configured'; badge.className = 'integration-badge disconnected'; }
+      }
+    })
+    .catch(() => {
+      const badge = document.getElementById('badge-atlassian');
+      if (badge) { badge.textContent = 'Unknown'; badge.className = 'integration-badge disconnected'; }
+    });
+}
+
 function openSettingsModal() {
   loadConfig();
   document.getElementById('settings-modal').classList.add('active');
   renderSettingsModal();
-  // Auto-test integrations via batch endpoint (faster than individual tests)
+  loadAtlassianCredentials();
+
+  // Auto-test non-Atlassian integrations (Atlassian badge handled by loadAtlassianCredentials)
   setTimeout(() => {
     fetch(`${API_BASE}/api/integrations/status`)
       .then(r => r.json())
       .then(data => {
         if (!data.ok) return;
         Object.entries(data.status).forEach(([id, connected]) => {
+          if (id === 'atlassian') return; // handled by loadAtlassianCredentials
           const badge = document.getElementById('badge-' + id);
           const connectBtn = document.getElementById('connect-btn-' + id);
           if (badge) {
             badge.textContent = connected ? 'Connected' : 'Not Connected';
             badge.className = 'integration-badge ' + (connected ? 'connected' : 'disconnected');
           }
-          // Google/Slack: show Reconnect when connected
-          if (id !== 'atlassian' && connectBtn) {
+          if (connectBtn) {
             connectBtn.textContent = connected ? 'Reconnect' : ({ 'google-workspace': 'Connect Google Account', 'slack': 'Connect Slack' }[id] || 'Connect');
-          }
-          // Atlassian: hide credential fields when connected
-          if (id === 'atlassian') {
-            const emailField = document.getElementById('atlassian-email');
-            const tokenField = document.getElementById('atlassian-token');
-            const instrEl = document.querySelector('#server-atlassian .integration-instructions');
-            if (connected) {
-              if (emailField) emailField.style.display = 'none';
-              if (tokenField) tokenField.style.display = 'none';
-              if (instrEl) instrEl.style.display = 'none';
-              if (connectBtn) connectBtn.style.display = 'none';
-            } else {
-              if (emailField) emailField.style.display = '';
-              if (tokenField) tokenField.style.display = '';
-              if (instrEl) instrEl.style.display = '';
-              if (connectBtn) connectBtn.style.display = '';
-            }
           }
         });
       })
       .catch(() => {
-        ['google-workspace', 'slack', 'atlassian'].forEach(id => {
+        ['google-workspace', 'slack'].forEach(id => {
           const badge = document.getElementById('badge-' + id);
           if (badge) { badge.textContent = 'Error'; badge.className = 'integration-badge disconnected'; }
         });
@@ -4745,12 +4739,12 @@ function renderSettingsModal() {
           <span class="integration-card-name">Atlassian (Jira & Confluence)</span>
           <span class="integration-card-desc">Search issues, read wiki pages, and manage tickets.</span>
         </div>
-        <span class="integration-badge checking" id="badge-atlassian">Checking...</span>
+        <span class="integration-badge disconnected" id="badge-atlassian">Not Connected</span>
       </div>
       <div class="integration-instructions">Create an API token at <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank">id.atlassian.com</a>, then enter your CMT Atlassian email and paste the token below.</div>
       <form autocomplete="off" onsubmit="event.preventDefault();saveAtlassianCredentials(document.getElementById('connect-btn-atlassian'))">
-      <input type="email" class="integration-field" id="atlassian-email" placeholder="you@cmtelematics.com" value="">
-      <input type="password" class="integration-field" id="atlassian-token" placeholder="API token">
+      <input type="email" class="integration-field" id="atlassian-email" placeholder="you@cmtelematics.com" value="" autocomplete="username">
+      <input type="password" class="integration-field" id="atlassian-token" placeholder="API token" autocomplete="current-password" onfocus="if(this.dataset.saved==='1'){this.value='';delete this.dataset.saved;}">
       <div class="integration-card-actions" id="actions-atlassian">
         <button type="button" class="settings-action-btn connect-btn" id="connect-btn-atlassian" onclick="saveAtlassianCredentials(this)">Save Atlassian Credentials</button>
       </div>

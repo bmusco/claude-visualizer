@@ -12,6 +12,16 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+// WebSocket keepalive — ping every 30s to prevent idle timeout from load balancers
+const WS_PING_INTERVAL = 30000;
+setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (ws.isAlive === false) { ws.terminate(); return; }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, WS_PING_INTERVAL);
+
 const PORT = process.env.PORT || 3333;
 const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || 'claude';
 const USER_HOME = process.env.CLAUDIO_HOME || os.homedir();
@@ -36,7 +46,7 @@ try {
 // ── MCP integration test commands (shared across endpoints) ─────
 const MCP_TEST_COMMANDS = {
   'google-workspace': 'Use the mcp__google-workspace__gdrive_search tool to search for "test" with max 1 result. Return only the result.',
-  'atlassian': 'Use the mcp__atlassian__jira_get_all_projects tool to list projects with limit 1. Return only the result.',
+  'atlassian': 'Use the mcp__atlassian__jira_list_projects tool to list projects with limit 1. Return only the result.',
   'slack': 'Use the mcp__slack__slack_list_channels tool to list channels with limit 1. Return only the result.'
 };
 
@@ -72,6 +82,7 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, X-Title, X-Filename');
   res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Max-Age', '3600');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -729,8 +740,14 @@ app.get('/api/config', (req, res) => {
 });
 
 // Test MCP connection by running a simple tool call
-app.post('/api/config/test/:server', (req, res) => {
+app.post('/api/config/test/:server', async (req, res) => {
   const serverName = req.params.server;
+
+  // Atlassian: test directly with API token to avoid triggering OAuth
+  if (serverName === 'atlassian') {
+    const ok = await testAtlassianDirect();
+    return res.json({ ok });
+  }
 
   const prompt = MCP_TEST_COMMANDS[serverName];
   if (!prompt) {
@@ -754,7 +771,25 @@ let integrationStatusCache = {};
 let integrationStatusCacheTime = 0;
 const INTEGRATION_CACHE_TTL = 120000; // 2 minutes
 
+function testAtlassianDirect() {
+  return new Promise(resolve => {
+    try {
+      const credPath = path.join(os.homedir(), '.claude', 'mcp-credentials', 'atlassian.json');
+      if (!fs.existsSync(credPath)) return resolve(false);
+      const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8'));
+      if (!creds.email || !creds.token) return resolve(false);
+      const auth = Buffer.from(`${creds.email}:${creds.token}`).toString('base64');
+      const url = 'https://cmtelematics.atlassian.net/rest/api/3/myself';
+      fetch(url, { headers: { 'Authorization': `Basic ${auth}`, 'Accept': 'application/json' } })
+        .then(r => resolve(r.ok))
+        .catch(() => resolve(false));
+    } catch { resolve(false); }
+  });
+}
+
 function testOneIntegration(server) {
+  // Atlassian: test directly with API token to avoid triggering OAuth
+  if (server === 'atlassian') return testAtlassianDirect();
   return new Promise(resolve => {
     const proc = spawn(CLAUDE_CLI, ['-p', '--output-format', 'text', MCP_TEST_COMMANDS[server]], {
       env: { ...process.env, HOME: USER_HOME },
@@ -827,16 +862,32 @@ app.post('/api/integrations/connect/:server', (req, res) => {
   });
 });
 
+// Check for saved Atlassian credentials
+app.get('/api/integrations/atlassian/credentials', (req, res) => {
+  const credPath = path.join(os.homedir(), '.claude', 'mcp-credentials', 'atlassian.json');
+  try {
+    if (fs.existsSync(credPath)) {
+      const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8'));
+      return res.json({ ok: true, email: creds.email || '', hasToken: !!creds.token, updated: creds.updated });
+    }
+  } catch {}
+  res.json({ ok: false });
+});
+
 // Save Atlassian API credentials
 app.post('/api/integrations/atlassian/credentials', (req, res) => {
   const { email, token } = req.body;
   if (!email || !token) return res.json({ ok: false, error: 'Email and token are required' });
 
-  // Store credentials in a local file for the MCP server to use
+  // Store credentials in a local file
   const credDir = path.join(os.homedir(), '.claude', 'mcp-credentials');
   try { fs.mkdirSync(credDir, { recursive: true }); } catch {}
   const credPath = path.join(credDir, 'atlassian.json');
   fs.writeFileSync(credPath, JSON.stringify({ email, token, updated: new Date().toISOString() }, null, 2));
+
+  // Credentials are read by /app/scripts/atlassian-mcp-wrapper.sh at MCP server startup
+  console.log('[DB] Atlassian API credentials saved for', email);
+
   res.json({ ok: true, message: 'Atlassian credentials saved' });
 });
 
@@ -1962,6 +2013,9 @@ function parseCookieHeader(cookieStr) {
 }
 
 wss.on('connection', (ws, req) => {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
   const cookies = parseCookieHeader(req.headers.cookie);
   ws.sessionId = cookies.claudio_sid || null;
   ws.userSession = ws.sessionId ? userTokenStore.get(ws.sessionId) : null;

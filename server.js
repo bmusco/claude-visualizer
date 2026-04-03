@@ -2552,7 +2552,7 @@ wss.on('connection', (ws, req) => {
                   lastResultTable = table;
                   lastResultMeta = `${result.rows.length} rows, ${duration}ms, ${db}`;
                   const wasTruncated = result.rows.length >= 10 && !/\bLIMIT\s+\d+/i.test(currentSql);
-                  feedbackMsg = `Query on ${db} returned ${result.rows.length} rows (${duration}ms)${wasTruncated ? ' (PREVIEW — capped at 10 rows, full results will be shown to user)' : ''}:\n\n${table}\n\nIf this query answers the user's question, summarize it${wasTruncated ? ' (note: user will see ALL rows, not just this preview)' : ''}. If not (e.g. 0 rows or wrong columns), write a corrected \`\`\`sql block.`;
+                  feedbackMsg = `Query on ${db} returned ${result.rows.length} rows (${duration}ms)${wasTruncated ? ' (PREVIEW — capped at 10 rows, full results will be shown to user)' : ''}:\n\n${table}\n\nIf this query answers the user's question, summarize it${wasTruncated ? ' (note: user will see ALL rows, not just this preview)' : ''}. If not (e.g. 0 rows or wrong columns), write a corrected \`\`\`sql block.${wasTruncated ? ' If you include a chart panel, the system will automatically populate it with the FULL query results — just use the correct chart type and title, the data will be replaced.' : ''}`;
                 }
               } catch (err) {
                 console.error(`[SQL-EXEC] Iter ${i} error: ${err.message}`);
@@ -2648,20 +2648,26 @@ wss.on('connection', (ws, req) => {
 
                 // Phase 2: Re-run final query WITHOUT row limit, then show results
                 console.log(`[SQL-EXEC] Displaying: lastQuery=${!!lastQuerySql}, lastTable=${!!lastResultTable}, summaryLen=${resumeResult.text.length}, wsState=${ws.readyState}`);
+                let finalResultRows = null;
+                let finalResultFields = null;
                 if (lastQuerySql) {
                   try {
                     safeSend({ action: 'chat-status', text: 'Fetching full results...', conversationId: convId });
+                    // Strip any LIMIT clause Claude may have added so we get all rows
+                    const unlimitedSql = lastQuerySql.replace(/\s+LIMIT\s+\d+\s*$/i, '');
                     const finalStart = Date.now();
-                    const finalResult = await executeQuery(lastQuerySql, db);
+                    const finalResult = await executeQuery(unlimitedSql, db);
                     const finalDuration = Date.now() - finalStart;
-                    const finalFields = finalResult.fields;
-                    let finalTable = '| ' + finalFields.join(' | ') + ' |\n| ' + finalFields.map(() => '---').join(' | ') + ' |\n';
-                    for (const row of finalResult.rows) {
-                      finalTable += '| ' + finalFields.map(f => String(row[f] ?? '')).join(' | ') + ' |\n';
+                    finalResultFields = finalResult.fields;
+                    finalResultRows = finalResult.rows;
+                    let finalTable = '| ' + finalResultFields.join(' | ') + ' |\n| ' + finalResultFields.map(() => '---').join(' | ') + ' |\n';
+                    for (const row of finalResultRows) {
+                      finalTable += '| ' + finalResultFields.map(f => String(row[f] ?? '')).join(' | ') + ' |\n';
                     }
                     lastResultTable = finalTable;
-                    lastResultMeta = `${finalResult.rows.length} rows, ${finalDuration}ms, ${db}`;
-                    console.log(`[SQL-EXEC] Final unlimited query: ${finalResult.rows.length} rows, ${finalDuration}ms`);
+                    lastResultMeta = `${finalResultRows.length} rows, ${finalDuration}ms, ${db}`;
+                    lastQuerySql = unlimitedSql;
+                    console.log(`[SQL-EXEC] Final unlimited query: ${finalResultRows.length} rows, ${finalDuration}ms`);
                   } catch (err) {
                     console.error(`[SQL-EXEC] Final unlimited query failed, using limited results: ${err.message}`);
                     // Fall back to the limited results we already have
@@ -2672,10 +2678,46 @@ wss.on('connection', (ws, req) => {
                   safeSend({ action: 'chat-chunk', text: sqlDisplay });
                   output += sqlDisplay;
                 }
+                // If Claude's summary contains a chart panel, replace fabricated data with actual query results
+                let summaryText = resumeResult.text || '';
+                if (finalResultRows && finalResultFields && summaryText.includes('<!--PANEL:')) {
+                  const panelMatch = summaryText.match(/<!--PANEL:([\s\S]*?)-->/);
+                  if (panelMatch) {
+                    try {
+                      const panelData = JSON.parse(panelMatch[1]);
+                      if (panelData.type && panelData.type.startsWith('chart-')) {
+                        // Build Chart.js data from actual query results
+                        const fields = finalResultFields;
+                        // First column = labels, remaining numeric columns = datasets
+                        const labelField = fields[0];
+                        const labels = finalResultRows.map(r => String(r[labelField] ?? ''));
+                        const datasets = [];
+                        for (let fi = 1; fi < fields.length; fi++) {
+                          const vals = finalResultRows.map(r => {
+                            const v = r[fields[fi]];
+                            return typeof v === 'number' ? v : parseFloat(v) || 0;
+                          });
+                          // Only include columns that have at least one non-zero numeric value
+                          if (vals.some(v => v !== 0)) {
+                            datasets.push({ label: fields[fi], data: vals });
+                          }
+                        }
+                        if (datasets.length > 0) {
+                          panelData.content = { labels, datasets };
+                          const newPanel = `<!--PANEL:${JSON.stringify(panelData)}-->`;
+                          summaryText = summaryText.replace(/<!--PANEL:[\s\S]*?-->/, newPanel);
+                          console.log(`[SQL-EXEC] Replaced chart panel data with ${finalResultRows.length} rows of actual query results`);
+                        }
+                      }
+                    } catch (e) {
+                      console.error(`[SQL-EXEC] Failed to replace chart data: ${e.message}`);
+                    }
+                  }
+                }
                 // Stream the summary text
-                if (resumeResult.text) {
-                  safeSend({ action: 'chat-chunk', text: resumeResult.text });
-                  output += resumeResult.text;
+                if (summaryText) {
+                  safeSend({ action: 'chat-chunk', text: summaryText });
+                  output += summaryText;
                 }
                 break;
               }

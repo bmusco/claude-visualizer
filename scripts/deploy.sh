@@ -17,6 +17,15 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 log "Checking AWS identity..."
 aws sts get-caller-identity --region "$AWS_REGION" > /dev/null
 
+# ── Sync memories ─────────────────────────────────────────────────
+MEMORY_SRC="${HOME}/.claude/projects/-Users-${USER}/memory"
+MEMORY_DEST="./memory"
+if [ -d "$MEMORY_SRC" ]; then
+  log "Syncing memories from ${MEMORY_SRC}..."
+  mkdir -p "$MEMORY_DEST"
+  cp "$MEMORY_SRC"/*.md "$MEMORY_DEST/" 2>/dev/null || true
+fi
+
 # ── Build ─────────────────────────────────────────────────────────
 log "Building image: claudio:${IMAGE_TAG}"
 docker build --platform linux/amd64 -t "claudio:${IMAGE_TAG}" .

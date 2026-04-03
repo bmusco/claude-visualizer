@@ -2022,6 +2022,60 @@ a.panel-btn { text-decoration: none; }
   50% { opacity: 1; transform: scale(1.2); }
 }
 
+/* Inline re-auth card */
+.reauth-card {
+  background: var(--card-bg, #1a1a2e);
+  border: 1px solid #F59E0B;
+  border-radius: 8px;
+  padding: 16px;
+  max-width: 480px;
+}
+.reauth-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.reauth-cmd {
+  display: block;
+  font-size: 11px;
+  padding: 8px;
+  background: #0d0d1a;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: all;
+  margin: 8px 0;
+  word-break: break-all;
+}
+.reauth-paste {
+  width: 100%;
+  font-family: monospace;
+  font-size: 12px;
+  padding: 8px;
+  background: #0d0d1a;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  resize: vertical;
+  margin-bottom: 8px;
+}
+.reauth-btn {
+  background: #F59E0B;
+  color: #fff;
+  border: none;
+  padding: 8px 20px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+.reauth-btn:hover { background: #D97706; }
+.reauth-btn:disabled { opacity: 0.6; cursor: default; }
+.reauth-status {
+  margin-top: 8px;
+  font-size: 12px;
+}
+
 .history-rename-input {
   width: 100%;
   padding: 4px 8px;

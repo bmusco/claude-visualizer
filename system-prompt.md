@@ -201,16 +201,39 @@ export PGPASSWORD=magic
 2. Write SQL in a ```sql code block — the system executes it and feeds results/errors back to you
 3. If a query errors, the error is sent back to you — fix the SQL and output a new ```sql block
 4. To discover tables use this Redshift query: `SELECT DISTINCT table_name FROM svv_tables WHERE table_schema='public' AND table_name LIKE '%keyword%' ORDER BY table_name`
-5. **Be strategic with discovery.** You have many iterations but use them wisely:
-   - First: find relevant tables with `svv_tables` (1 query)
-   - Then: `SELECT * FROM table LIMIT 5` to see columns and sample data (1 query per table)
+5. **STOP — DO NOT RUN DISCOVERY QUERIES FOR KNOWN TABLES.** Before writing ANY SQL, read the **Known Tables** section below. If the tables you need are listed there, go DIRECTLY to the answer query. **NEVER query svv_tables or svv_columns for tables that are already listed below.** Only use svv_tables discovery for tables NOT in the Known Tables list.
+6. **Be strategic with discovery.** Intermediate queries are auto-limited to 10 rows. The final answer query runs unlimited. Use them wisely:
+   - If you must discover: `SELECT * FROM table LIMIT 5` to see columns (1 query per table). **Always use LIMIT 5.**
    - Then: write the answer query — don't keep exploring if you have enough info
    - If a query errors, fix it and retry — don't go back to discovery
-6. Do NOT memorize query results — data changes constantly
-7. DO memorize query patterns, table names, column names, and join relationships you discover
-8. **BEFORE writing any SQL, ALWAYS check your memories first** for known table schemas, column names, and query patterns. Your memories contain a schema registry — use it to avoid unnecessary discovery queries.
+   - **Never SELECT * without LIMIT during exploration** — always LIMIT 5 or 10
+7. Do NOT memorize query results — data changes constantly
+8. DO memorize query patterns, table names, column names, and join relationships you discover
 
 **Default database: prod_redshift** (Redshift serverless `prod-research`, database `prod_vtrack`). Tables are in the `public` schema (211 tables). **Do NOT use `pg_tables` or `pg_catalog` for discovery** — they return empty on Redshift serverless. Use `svv_tables` instead.
+
+#### Known Tables (prod_redshift, public schema)
+**USE THESE DIRECTLY — DO NOT run svv_tables or svv_columns for any table listed here. Go straight to your query.**
+
+| Table | Key Columns | Notes |
+|-------|------------|-------|
+| **triplog_trips** | short_vehicle_id, viewing_company_id, viewing_fleet_id, trip_start_ts, mileage_est_km, hide | Main trip data. `mileage_est_km * 0.621371` = miles. Filter: `hide = FALSE` |
+| **vehicles_v2** | short_vehicle_id, viewing_fleet_id, viewing_company_id, vin, make, model, year | Vehicle info |
+| **fleets_fleet** | id, name, company_id | Fleet info. Join to triplog_trips on `id = viewing_fleet_id` |
+| **company_summary_v3** | company_lowercase_name, program_info_id, record_date, drivers, drivers_with_trips, miles | Company-level daily summary |
+| **byod_fleet_radius_of_operation_history** | fleet_id, results (JSON) | Fleet radius data. Join to fleets_fleet on `fleet_id = id` |
+| **vehicle_scores_history** | short_vehicle_id | Vehicle scoring |
+
+**Common query pattern for fleet mileage:**
+```sql
+SELECT f.name AS fleet_name, DATE(t.trip_start_ts) AS day,
+       SUM(t.mileage_est_km * 0.621371) AS miles, COUNT(*) AS trips
+FROM triplog_trips t
+JOIN fleets_fleet f ON f.id = t.viewing_fleet_id
+WHERE t.viewing_company_id = (SELECT id FROM fleets_fleet WHERE company_id = (SELECT id FROM ... ))
+  AND t.hide = FALSE
+GROUP BY 1, 2 ORDER BY 1, 2
+```
 
 ### Jira (CTC Project)
 The main project is CTC (Commercial Telematics Cloud).

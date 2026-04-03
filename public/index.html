@@ -180,9 +180,32 @@
             </button>
           </div>
         </div>
-        <div class="chat-input-disclaimer">
+        <div class="chat-input-disclaimer" id="chat-disclaimer">
+          <span id="db-status-indicator"></span>
           Claude can make mistakes. Check important info.
         </div>
+        <script>
+        (function() {
+          var el = document.getElementById('db-status-indicator');
+          function checkDb() {
+            var apiBase = window.CLAUDIO_API_BASE || '';
+            fetch(apiBase + '/api/db-credentials').then(function(r){return r.json()}).then(function(d) {
+              var ok = d.pgproxyAvailable || d.status === 'valid';
+              if (ok) {
+                el.innerHTML = '<span style="color:#22c55e">&#9679;</span> DB';
+                el.style.cssText = 'color:#888;margin-right:6px;font-size:11px;cursor:pointer';
+              } else {
+                var label = d.status === 'expired' ? 'DB expired' : 'DB disconnected';
+                el.innerHTML = '<span style="color:#ef4444">&#9679;</span> ' + label;
+                el.style.cssText = 'color:#ef4444;margin-right:6px;font-size:11px;cursor:pointer;font-weight:600';
+              }
+              el.onclick = function(){ if(typeof openSettingsModal==='function') openSettingsModal(); };
+            }).catch(function(){});
+          }
+          checkDb();
+          setInterval(checkDb, 30000);
+        })();
+        </script>
       </div>
     </div>
   </div> <!-- close app-layout -->

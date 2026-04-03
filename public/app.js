@@ -46,6 +46,30 @@ function connect() {
     } else if (data.action === 'clear') {
       panels = [];
       renderAll();
+    } else if (data.action === 'db-status') {
+      // Update DB indicator and show banner if not connected
+      const indicator = document.getElementById('db-status-indicator');
+      if (indicator) {
+        if (data.connected) {
+          indicator.innerHTML = '<span style="color:#22c55e">&#9679;</span> DB';
+          indicator.style.cssText = 'color:#888;margin-right:6px;font-size:11px;cursor:pointer';
+        } else {
+          const label = data.status === 'expired' ? 'DB expired' : 'DB disconnected';
+          indicator.innerHTML = '<span style="color:#ef4444">&#9679;</span> ' + label;
+          indicator.style.cssText = 'color:#ef4444;margin-right:6px;font-size:11px;cursor:pointer;font-weight:600';
+        }
+        indicator.onclick = function(){ openSettingsModal(); };
+      }
+      if (!data.connected) {
+        const msg = data.status === 'expired'
+          ? 'Database credentials have expired. Queries will fail until you re-authenticate.'
+          : 'Database not connected. Queries will fail until you import credentials in Settings.';
+        showDbBanner(msg);
+      } else {
+        dismissDbBanner();
+      }
+    } else if (data.action === 'db-warning') {
+      showDbBanner(data.text);
     } else if (data.action && data.action.startsWith('chat-')) {
       handleChatMessage(data);
     }
@@ -90,25 +114,6 @@ function renderSettingsDropdown(config) {
   const dd = document.getElementById('settings-dropdown');
   let html = '';
 
-  // AWS Bedrock / Provider
-  const bedrockSource = config.sources.find(s => s.name === 'AWS Bedrock');
-  if (bedrockSource) {
-    html += `<div class="settings-section">
-      <div class="settings-section-title">AI Provider</div>
-      <div class="settings-item">
-        <span class="status-dot info"></span>
-        <span class="item-label">AWS Bedrock</span>
-        <span class="item-detail">${escapeHtml(bedrockSource.detail || '')}</span>
-      </div>
-      <div class="settings-item">
-        <span class="item-label" style="font-size:12px;color:var(--text-muted)">Model: ${escapeHtml(config.model.current || '')}</span>
-      </div>
-      <div class="settings-auth-actions">
-        <button class="settings-action-btn" onclick="refreshAws(this)">Refresh AWS SSO</button>
-      </div>
-    </div>`;
-  }
-
   // Per-user OAuth integrations (always show — auth is per-user, not server-wide)
   const oauthIntegrations = [
     { id: 'google-workspace', name: 'Google Workspace', shortName: 'Google', desc: 'Connect your Google account to give the assistant read-only access to Gmail, Calendar, Drive, Docs, Slides, and Tasks.' },
@@ -148,23 +153,6 @@ function renderSettingsDropdown(config) {
       </div>
     </div>`;
   }
-
-  // Sources & CLI
-  html += `<div class="settings-section">
-    <div class="settings-section-title">Sources</div>
-    ${config.sources.filter(s => s.type !== 'provider').map(s => `
-      <div class="settings-item">
-        <span class="status-dot source"></span>
-        <span class="item-label">${escapeHtml(s.name)}</span>
-        <span class="item-detail">${escapeHtml(s.detail || '')}</span>
-      </div>
-    `).join('')}
-  </div>`;
-
-  // Clear All action
-  html += `<div class="settings-section">
-    <button class="settings-action-btn" style="width:100%" onclick="clearAllPanels()">Clear All Panels</button>
-  </div>`;
 
   dd.innerHTML = html;
 
@@ -367,7 +355,7 @@ function saveDbCredentials(btn) {
     return;
   }
 
-  btn.textContent = 'Saving...';
+  btn.textContent = 'Validating...';
   btn.disabled = true;
 
   fetch(`${API_BASE}/api/db-credentials`, {
@@ -379,7 +367,7 @@ function saveDbCredentials(btn) {
     .then(data => {
       if (data.ok) {
         if (badge) { badge.textContent = 'Active'; badge.className = 'integration-badge connected'; }
-        if (statusMsg) { statusMsg.textContent = 'Credentials saved. Prod Redshift queries are now enabled.'; statusMsg.className = 'settings-status-msg ok'; }
+        if (statusMsg) { statusMsg.textContent = 'Credentials validated. Prod Redshift queries are now enabled.'; statusMsg.className = 'settings-status-msg ok'; }
         dismissDbBanner();
       } else {
         if (badge) { badge.textContent = 'Error'; badge.className = 'integration-badge disconnected'; }
@@ -397,7 +385,7 @@ function saveDbCredentials(btn) {
 
 function quickImportDbCredentials(btn) {
   const textarea = document.getElementById('db-quick-paste');
-  const raw = (textarea ? textarea.value : '').trim();
+  const raw = (textarea ? (textarea.dataset.rawValue || textarea.value) : '').trim();
   const statusMsg = document.getElementById('status-database');
 
   if (!raw) {
@@ -417,7 +405,7 @@ function quickImportDbCredentials(btn) {
     return;
   }
 
-  btn.textContent = 'Saving...';
+  btn.textContent = 'Validating...';
   btn.disabled = true;
 
   fetch(`${API_BASE}/api/db-credentials`, {
@@ -428,8 +416,8 @@ function quickImportDbCredentials(btn) {
     .then(r => r.json())
     .then(data => {
       if (data.ok) {
-        if (statusMsg) { statusMsg.textContent = 'Credentials imported successfully!'; statusMsg.className = 'settings-status-msg ok'; }
-        textarea.value = '*** credentials saved ***'
+        if (statusMsg) { statusMsg.textContent = 'Credentials validated and saved!'; statusMsg.className = 'settings-status-msg ok'; }
+        textarea.value = '*** credentials verified ***'
         textarea.style.color = '#666';
         checkDbCredentialStatus();
         dismissDbBanner();
@@ -477,16 +465,41 @@ function autoFillDbCredentials(btn) {
 function checkDbCredentialStatus() {
   fetch(`${API_BASE}/api/db-credentials`).then(r => r.json()).then(data => {
     const badge = document.getElementById('badge-database');
-    if (!badge) return;
-    if (data.pgproxyAvailable) {
-      badge.textContent = 'pgproxy'; badge.className = 'integration-badge connected';
-    } else if (data.status === 'valid') {
-      badge.textContent = 'Active'; badge.className = 'integration-badge connected';
-    } else if (data.status === 'expired') {
-      badge.textContent = 'Expired'; badge.className = 'integration-badge disconnected';
-      showDbBanner('Database credentials have expired. Open Settings to refresh them.');
-    } else {
-      badge.textContent = 'Not Configured'; badge.className = 'integration-badge disconnected';
+    const indicator = document.getElementById('db-status-indicator');
+    const connected = data.pgproxyAvailable || data.status === 'valid';
+    if (badge) {
+      if (data.pgproxyAvailable) {
+        badge.textContent = 'pgproxy'; badge.className = 'integration-badge connected';
+      } else if (data.status === 'valid') {
+        badge.textContent = 'Active'; badge.className = 'integration-badge connected';
+      } else if (data.status === 'expired') {
+        badge.textContent = 'Expired'; badge.className = 'integration-badge disconnected';
+      } else {
+        badge.textContent = 'Not Configured'; badge.className = 'integration-badge disconnected';
+      }
+    }
+    // Update inline DB status indicator (always visible in chat)
+    if (indicator) {
+      if (connected) {
+        indicator.innerHTML = '<span style="color:#22c55e">&#9679;</span> DB connected';
+        indicator.style.display = 'inline';
+        indicator.style.color = '#888';
+        indicator.style.marginRight = '8px';
+      } else {
+        const label = data.status === 'expired' ? 'DB credentials expired' : 'DB not connected';
+        indicator.innerHTML = '<span style="color:#ef4444">&#9679;</span> ' + label + ' — click to fix';
+        indicator.style.display = 'inline';
+        indicator.style.color = '#ef4444';
+        indicator.style.marginRight = '8px';
+      }
+    }
+    // Show banner when DB queries won't work
+    if (!connected) {
+      if (data.status === 'expired') {
+        showDbBanner('Database credentials have expired. Re-authenticate to run queries.');
+      } else {
+        showDbBanner('Database not connected. Import credentials in Settings to enable queries.');
+      }
     }
   }).catch(() => {});
 }
@@ -1626,6 +1639,7 @@ IMPORTANT: Preserve the formatting from the HTML below. Maintain headings, bold 
   streamingConversationId = activeConversationId;
   currentResponseText = '';
   updateSendButton();
+  renderHistoryList();
   showStatus();
   ws.send(JSON.stringify({ action: 'chat', text: prompt, files: [], conversationId: activeConversationId }));
 
@@ -1670,6 +1684,7 @@ function convertToEmbedUrl(url, mimeType) {
 }
 
 function renderChart(canvas, type, content) {
+  if (!canvas) return;
   let data;
   try {
     data = typeof content === 'string' ? JSON.parse(content) : content;
@@ -1677,6 +1692,10 @@ function renderChart(canvas, type, content) {
     canvas.parentElement.innerHTML = `<p style="color: var(--danger)">Invalid chart JSON: ${e.message}</p>`;
     return;
   }
+
+  // Destroy any existing Chart instance on this canvas to prevent leaks
+  const existing = Chart.getChart(canvas);
+  if (existing) existing.destroy();
 
   new Chart(canvas, {
     type: type,
@@ -2577,6 +2596,9 @@ function applyEditResponse(responseText) {
         body: JSON.stringify({ content: panel.content, title: panel.title })
       });
 
+      // Remove existing DOM element so renderAll recreates it with new content
+      const oldEl = document.querySelector(`.panel[data-id="${panel.id}"]`);
+      if (oldEl) oldEl.remove();
       renderAll();
     }
   } catch (e) {
@@ -3357,7 +3379,8 @@ function liveScanGSlides(text) {
     // Clean the marker from displayed message
     if (currentResponseEl) {
       const cleanText = text.replace(/<!--GSLIDES:[\s\S]*-->/, '').trim();
-      currentResponseEl.innerHTML = cleanText
+      const cw = currentResponseEl.querySelector('.chat-msg-content') || currentResponseEl;
+      cw.innerHTML = cleanText
         ? marked.parse(cleanText)
         : '<em style="color:var(--text-muted)">' + (editingPanel ? 'Updated' : 'Created') + ' presentation preview on canvas.</em>';
     }
@@ -3380,6 +3403,9 @@ function liveScanGSlides(text) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content: newContent, title: data.title })
         });
+        // Remove existing DOM element so renderAll recreates it with new content
+        const oldEl = document.querySelector(`.panel[data-id="${panel.id}"]`);
+        if (oldEl) oldEl.remove();
         renderAll();
       }
     } else {
@@ -3425,12 +3451,13 @@ function liveScanPanel(text) {
       });
       // Clean the panel marker from displayed message
       if (currentResponseEl) {
+        const cw = currentResponseEl.querySelector('.chat-msg-content') || currentResponseEl;
         const cleanText = text.replace(/<!--PANEL:[\s\S]*?-->/, '').trim();
         if (cleanText) {
-          currentResponseEl.innerHTML = marked.parse(cleanText);
-          currentResponseEl.querySelectorAll('pre code').forEach(block => hljs.highlightElement(block));
+          cw.innerHTML = marked.parse(cleanText);
+          cw.querySelectorAll('pre code').forEach(block => hljs.highlightElement(block));
         } else {
-          currentResponseEl.innerHTML = '<em style="color:var(--text-muted)">Created panel on canvas.</em>';
+          cw.innerHTML = '<em style="color:var(--text-muted)">Created panel on canvas.</em>';
         }
       }
     }
@@ -3457,12 +3484,13 @@ function extractAndCreatePanel(text) {
       });
 
       if (currentResponseEl) {
+        const cw = currentResponseEl.querySelector('.chat-msg-content') || currentResponseEl;
         const cleanText = currentResponseText.replace(/<!--PANEL:[\s\S]*?-->/, '').trim();
         if (cleanText) {
-          currentResponseEl.innerHTML = marked.parse(cleanText);
-          currentResponseEl.querySelectorAll('pre code').forEach(block => hljs.highlightElement(block));
+          cw.innerHTML = marked.parse(cleanText);
+          cw.querySelectorAll('pre code').forEach(block => hljs.highlightElement(block));
         } else {
-          currentResponseEl.innerHTML = '<em style="color:var(--text-muted)">Created panel on canvas.</em>';
+          cw.innerHTML = '<em style="color:var(--text-muted)">Created panel on canvas.</em>';
         }
       }
     }
@@ -3619,15 +3647,34 @@ function handleChatMessage(data) {
     gslidesCreatedThisResponse = false;
     _lastGSlidesAttemptLen = 0;
     lastCreatedPanelType = null;
+  } else if (data.action === 'db-warning') {
+    showDbBanner(data.text);
   } else if (data.action === 'chat-replace') {
     // Replace current response content (used when SQL execution takes over)
     currentResponseText = data.text || '';
+    // Cancel any pending render timers
+    if (_streamRenderTimer) { clearTimeout(_streamRenderTimer); _streamRenderTimer = null; }
+    if (_thinkingRenderTimer) { clearTimeout(_thinkingRenderTimer); _thinkingRenderTimer = null; }
     if (currentResponseEl) {
       const contentWrapper = currentResponseEl.querySelector('.chat-msg-content');
       if (contentWrapper) contentWrapper.innerHTML = data.text ? marked.parse(data.text) : '';
     }
+    // Re-enter streaming mode (SQL loop started after initial response completed)
+    if (!chatStreaming && data.conversationId) {
+      chatStreaming = true;
+      streamingConversationId = data.conversationId;
+      updateSendButton();
+      renderHistoryList();
+    }
   } else if (data.action === 'chat-status') {
-    if (!streamingElsewhere) updateStatus(data.text);
+    if (!streamingElsewhere) { updateStatus(data.text); scrollChat(); }
+    // Ensure thinking indicator stays on during SQL loop
+    if (!chatStreaming && data.conversationId) {
+      chatStreaming = true;
+      streamingConversationId = data.conversationId;
+      updateSendButton();
+      renderHistoryList();
+    }
   } else if (data.action === 'chat-thinking-start') {
     thinkingText = '';
     if (streamingElsewhere) return;
@@ -3780,6 +3827,12 @@ function handleChatMessage(data) {
       const contentWrapper = currentResponseEl.querySelector('.chat-msg-content');
       if (contentWrapper) addMsgActions(contentWrapper);
     }
+    // Save assistant response to current conversation
+    if (currentResponseText && streamingConversationId && conversations[streamingConversationId]) {
+      conversations[streamingConversationId].messages.push({ role: 'assistant', content: currentResponseText });
+      conversations[streamingConversationId].updatedAt = Date.now();
+      saveConversations();
+    }
     finishChat();
   } else if (data.action === 'chat-history') {
     // Server sends history on reconnect — restore if client has nothing
@@ -3810,11 +3863,109 @@ function handleChatMessage(data) {
     removeStatus();
     removeTypingIndicator();
     addChatMessage('assistant', `**Query error:** ${escapeHtml(data.error)}\n\n\`\`\`sql\n${escapeHtml(data.sql)}...\n\`\`\``, true);
+  } else if (data.action === 'db-auth-required') {
+    console.log('[DB-AUTH] Received db-auth-required, showing reauth card');
+    removeStatus();
+    removeTypingIndicator();
+    showInlineReauth();
+    finishChat();
   } else if (data.action === 'chat-error') {
     removeStatus();
     addChatMessage('assistant', 'Error: ' + data.text, false);
     finishChat();
   }
+}
+
+function showInlineReauth() {
+  const messages = document.getElementById('chat-messages');
+  const msg = document.createElement('div');
+  msg.className = 'chat-msg assistant';
+  const avatar = document.createElement('div');
+  avatar.className = 'chat-avatar assistant';
+  avatar.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="white"><path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"/></svg>';
+  const content = document.createElement('div');
+  content.className = 'chat-msg-content';
+  content.innerHTML = `
+    <div class="reauth-card">
+      <div class="reauth-header">
+        <span style="font-size:18px">&#x1f511;</span>
+        <strong>AWS credentials expired</strong>
+      </div>
+      <p style="margin:8px 0;font-size:13px;color:var(--text-muted)">Run this in your terminal, then paste the output below:</p>
+      <code class="reauth-cmd" onclick="navigator.clipboard.writeText(this.textContent).then(()=>{this.style.outline='2px solid var(--accent)';setTimeout(()=>this.style.outline='',800)})">cat ~/.aws/credentials | sed -n '/\\[cmtelematics-sso-user\\]/,/^\\[/p' | head -5</code>
+      <textarea class="reauth-paste" placeholder="Paste credentials here..." rows="4"></textarea>
+      <button class="reauth-btn" onclick="submitInlineReauth(this)">Re-authenticate</button>
+      <div class="reauth-status"></div>
+    </div>
+  `;
+  msg.appendChild(avatar);
+  msg.appendChild(content);
+  messages.appendChild(msg);
+  messages.scrollTop = messages.scrollHeight;
+
+  // Mask credentials after paste
+  const ta = content.querySelector('.reauth-paste');
+  if (ta) {
+    ta.addEventListener('paste', () => {
+      setTimeout(() => {
+        ta.dataset.rawValue = ta.value;
+        ta.value = '*** credentials pasted — click Re-authenticate ***';
+        ta.style.color = '#666';
+      }, 50);
+    });
+  }
+}
+
+function submitInlineReauth(btn) {
+  const card = btn.closest('.reauth-card');
+  const textarea = card.querySelector('.reauth-paste');
+  const statusEl = card.querySelector('.reauth-status');
+  const raw = (textarea.dataset.rawValue || textarea.value || '').trim();
+  if (!raw) { statusEl.textContent = 'Paste the credentials output first.'; statusEl.style.color = '#f87171'; return; }
+
+  const get = (key) => { const m = raw.match(new RegExp(key + '\\s*=\\s*(.+)')); return m ? m[1].trim() : ''; };
+  const accessKeyId = get('aws_access_key_id');
+  const secretAccessKey = get('aws_secret_access_key');
+  const sessionToken = get('aws_session_token');
+  const expiration = get('aws_session_expiration');
+
+  if (!accessKeyId || !secretAccessKey || !sessionToken) {
+    statusEl.textContent = 'Could not parse credentials. Make sure you pasted the full output.';
+    statusEl.style.color = '#f87171';
+    return;
+  }
+
+  btn.textContent = 'Validating...';
+  btn.disabled = true;
+
+  fetch(`${API_BASE}/api/db-credentials`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accessKeyId, secretAccessKey, sessionToken, expiration: expiration || null })
+  })
+    .then(r => r.json())
+    .then(data => {
+      if (data.ok) {
+        statusEl.textContent = 'Credentials validated! You can re-run your query.';
+        statusEl.style.color = '#4ade80';
+        textarea.value = '*** credentials verified ***';
+        textarea.style.color = '#666';
+        textarea.disabled = true;
+        btn.textContent = 'Done';
+        dismissDbBanner();
+      } else {
+        statusEl.textContent = data.error || 'Failed to save.';
+        statusEl.style.color = '#f87171';
+        btn.textContent = 'Re-authenticate';
+        btn.disabled = false;
+      }
+    })
+    .catch(() => {
+      statusEl.textContent = 'Network error.';
+      statusEl.style.color = '#f87171';
+      btn.textContent = 'Re-authenticate';
+      btn.disabled = false;
+    });
 }
 
 function renderQueryTable(fields, rows, rowCount, duration, sql) {
@@ -4423,11 +4574,12 @@ function renderHistoryList(filter) {
     const panelCount = panels.filter(p => p.conversationId === conv.id).length;
     const date = new Date(conv.updatedAt);
     const timeStr = formatHistoryDate(date);
+    const dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ', ' + date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
     return `
       <div class="history-item${isActive ? ' active' : ''}${isThinking ? ' thinking' : ''}" data-id="${conv.id}" onclick="loadConversation('${conv.id}')">
         <div class="history-item-title">${isThinking ? '<span class="thinking-indicator"></span>' : ''}${escapeHtml(conv.title)}</div>
         <div class="history-item-meta">
-          <span>${timeStr}</span>
+          <span title="${dateStr}">${timeStr} · ${dateStr}</span>
           <span>${msgCount} msg${msgCount !== 1 ? 's' : ''}${panelCount > 0 ? ' · ' + panelCount + ' panel' + (panelCount !== 1 ? 's' : '') : ''}</span>
         </div>
         <div class="history-item-actions">
@@ -4534,22 +4686,6 @@ function renderSettingsModal() {
   const body = document.getElementById('settings-modal-body');
   let html = '';
 
-  // AI Provider
-  const bedrockSource = config.sources.find(s => s.name === 'AWS Bedrock');
-  if (bedrockSource) {
-    html += `<div class="settings-section">
-      <div class="settings-section-title">AI Provider</div>
-      <div class="settings-item">
-        <span class="status-dot info"></span>
-        <span class="item-label">AWS Bedrock</span>
-        <span class="item-detail">${escapeHtml(bedrockSource.detail || '')}</span>
-      </div>
-      <div class="settings-auth-actions">
-        <button class="settings-action-btn" onclick="refreshAws(this)">Refresh AWS SSO</button>
-      </div>
-    </div>`;
-  }
-
   // Model Selection
   html += `<div class="settings-section">
     <div class="settings-section-title">Language Model</div>
@@ -4612,11 +4748,13 @@ function renderSettingsModal() {
         <span class="integration-badge checking" id="badge-atlassian">Checking...</span>
       </div>
       <div class="integration-instructions">Create an API token at <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank">id.atlassian.com</a>, then enter your CMT Atlassian email and paste the token below.</div>
+      <form autocomplete="off" onsubmit="event.preventDefault();saveAtlassianCredentials(document.getElementById('connect-btn-atlassian'))">
       <input type="email" class="integration-field" id="atlassian-email" placeholder="you@cmtelematics.com" value="">
       <input type="password" class="integration-field" id="atlassian-token" placeholder="API token">
       <div class="integration-card-actions" id="actions-atlassian">
-        <button class="settings-action-btn connect-btn" id="connect-btn-atlassian" onclick="saveAtlassianCredentials(this)">Save Atlassian Credentials</button>
+        <button type="button" class="settings-action-btn connect-btn" id="connect-btn-atlassian" onclick="saveAtlassianCredentials(this)">Save Atlassian Credentials</button>
       </div>
+      </form>
       <div class="settings-status-msg" id="status-atlassian"></div>
     </div>
 
@@ -4637,33 +4775,21 @@ function renderSettingsModal() {
         <code id="db-quick-cmd" style="font-size:11px;display:block;margin:6px 0;padding:8px;background:#1a1a2e;border-radius:4px;cursor:pointer;user-select:all" onclick="navigator.clipboard.writeText(this.textContent).then(()=>{this.style.outline='2px solid #527FFF';setTimeout(()=>this.style.outline='',800)})">cat ~/.aws/credentials | sed -n '/\\[cmtelematics-sso-user\\]/,/^\\[/p' | head -5</code>
         <span style="font-size:11px;color:#888">Click the command to copy it</span>
       </div>
-      <textarea class="integration-field" id="db-quick-paste" placeholder="Paste the output here..." style="min-height:80px;font-family:monospace;font-size:12px;resize:vertical"></textarea>
+      <textarea class="integration-field" id="db-quick-paste" placeholder="Paste the output here..." style="min-height:80px;font-family:monospace;font-size:12px;resize:vertical" onpaste="setTimeout(()=>{this.dataset.rawValue=this.value;this.value='*** credentials pasted — click Import ***';this.style.color='#666'},50)"></textarea>
       <div class="integration-card-actions" id="actions-database">
         <button class="settings-action-btn connect-btn" id="connect-btn-database" onclick="quickImportDbCredentials(this)">Import Credentials</button>
         <button class="settings-action-btn" onclick="autoFillDbCredentials(this)" style="margin-left:8px">Auto-fill from Server</button>
         <button class="settings-action-btn" onclick="document.getElementById('db-manual-fields').style.display=document.getElementById('db-manual-fields').style.display==='none'?'block':'none'" style="margin-left:8px;font-size:11px">Manual Entry</button>
       </div>
-      <div id="db-manual-fields" style="display:none;margin-top:8px">
-        <input type="text" class="integration-field" id="db-access-key" placeholder="AWS Access Key ID">
-        <input type="password" class="integration-field" id="db-secret-key" placeholder="AWS Secret Access Key">
-        <input type="password" class="integration-field" id="db-session-token" placeholder="AWS Session Token">
-        <input type="text" class="integration-field" id="db-expiration" placeholder="Expiration (optional)">
-        <button class="settings-action-btn connect-btn" onclick="saveDbCredentials(this)" style="margin-top:4px">Save Manual Credentials</button>
-      </div>
+      <form id="db-manual-fields" style="display:none;margin-top:8px" onsubmit="event.preventDefault();saveDbCredentials(this.querySelector('.connect-btn'))">
+        <input type="text" class="integration-field" id="db-access-key" placeholder="AWS Access Key ID" autocomplete="off">
+        <input type="password" class="integration-field" id="db-secret-key" placeholder="AWS Secret Access Key" autocomplete="off">
+        <input type="password" class="integration-field" id="db-session-token" placeholder="AWS Session Token" autocomplete="off">
+        <input type="text" class="integration-field" id="db-expiration" placeholder="Expiration (optional)" autocomplete="off">
+        <button type="button" class="settings-action-btn connect-btn" onclick="saveDbCredentials(this)" style="margin-top:4px">Save Manual Credentials</button>
+      </form>
       <div class="settings-status-msg" id="status-database"></div>
     </div>
-  </div>`;
-
-  // Sources
-  html += `<div class="settings-section">
-    <div class="settings-section-title">Sources</div>
-    ${config.sources.filter(s => s.type !== 'provider').map(s => `
-      <div class="settings-item">
-        <span class="status-dot source"></span>
-        <span class="item-label">${escapeHtml(s.name)}</span>
-        <span class="item-detail">${escapeHtml(s.detail || '')}</span>
-      </div>
-    `).join('')}
   </div>`;
 
   // Memory Management
@@ -4671,11 +4797,6 @@ function renderSettingsModal() {
     <div class="settings-section-title">Memory Management</div>
     <button class="settings-action-btn settings-memory-btn" onclick="closeSettingsModal(); openMemories()">Browse & Manage Memories</button>
     <button class="settings-action-btn settings-memory-btn" onclick="clearAllMemories()">Clear All Memories</button>
-  </div>`;
-
-  // Clear panels
-  html += `<div class="settings-section">
-    <button class="settings-action-btn" style="width:100%" onclick="clearAllPanels()">Clear All Panels</button>
   </div>`;
 
   body.innerHTML = html;
@@ -4998,4 +5119,5 @@ updateChatContext();
 restoreChatHistory();
 updateChatLayout();
 updateSendButton();
+checkDbCredentialStatus();
 setTimeout(flowLayout, 350);

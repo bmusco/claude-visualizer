@@ -26,6 +26,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
 ENV PATH="/home/appuser/.local/bin:${PATH}"
 ENV CLAUDE_CLI_PATH="/home/appuser/.local/bin/claude"
 
+# Copy memory files if present (baked into image, overridable via CLAUDIO_MEMORY_DIR)
+COPY --chown=appuser:appuser memory/ /home/appuser/.claude/projects/-Users-bmusco/memory/
+
 COPY --chown=appuser:appuser scripts/entrypoint.sh /app/entrypoint.sh
 
 ENTRYPOINT ["/app/entrypoint.sh"]

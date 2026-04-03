@@ -144,6 +144,15 @@ app.use((req, res, next) => {
   next();
 });
 
+// No-cache for HTML files so deploys take effect immediately
+app.use((req, res, next) => {
+  if (req.path === '/' || req.path.endsWith('.html')) {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  }
+  next();
+});
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Per-user OAuth — direct Google/Slack (no MCP proxy) ──────────
@@ -1035,17 +1044,52 @@ app.get('/api/db-credentials', (req, res) => {
   res.json({ ok: true, ...getDbCredentialStatus(), pgproxyAvailable });
 });
 
-app.post('/api/db-credentials', express.json(), (req, res) => {
+app.post('/api/db-credentials', express.json(), async (req, res) => {
   const { accessKeyId, secretAccessKey, sessionToken, expiration } = req.body;
   if (!accessKeyId || !secretAccessKey || !sessionToken) {
     return res.status(400).json({ ok: false, error: 'accessKeyId, secretAccessKey, and sessionToken are required' });
   }
 
-  dbCredentials = { accessKeyId, secretAccessKey, sessionToken, expiration: expiration || null, updatedAt: new Date().toISOString() };
-  redshiftClient = new RedshiftDataClient({
+  // Validate credentials by running a lightweight test query
+  const testClient = new RedshiftDataClient({
     region: REDSHIFT_REGION,
     credentials: { accessKeyId, secretAccessKey, sessionToken },
   });
+  try {
+    const testResp = await testClient.send(new ExecuteStatementCommand({
+      WorkgroupName: REDSHIFT_WORKGROUP,
+      Database: REDSHIFT_DATABASE,
+      Sql: 'SELECT 1',
+    }));
+    // Poll until the statement finishes or fails (up to 10s)
+    let desc;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await new Promise(r => setTimeout(r, 1000));
+      desc = await testClient.send(new DescribeStatementCommand({ Id: testResp.Id }));
+      if (desc.Status === 'FINISHED' || desc.Status === 'FAILED') break;
+    }
+    if (desc.Status === 'FAILED') {
+      const errMsg = desc.Error || 'Query failed';
+      if (/security token.*expired|token.*expired|expired/i.test(errMsg)) {
+        return res.json({ ok: false, error: 'Credentials are expired. Run cmtaws sso login and paste fresh credentials.' });
+      }
+      return res.json({ ok: false, error: 'Credentials failed validation: ' + errMsg });
+    }
+    console.log('[DB] Credential validation passed (status: ' + desc.Status + ')');
+  } catch (err) {
+    const msg = err.message || err.name || 'Unknown error';
+    if (/ExpiredToken|ExpiredTokenException|security token.*expired|token.*expired/i.test(msg)) {
+      return res.json({ ok: false, error: 'Credentials are expired. Run cmtaws sso login and paste fresh credentials.' });
+    }
+    if (/InvalidAccessKeyId|SignatureDoesNotMatch/i.test(msg)) {
+      return res.json({ ok: false, error: 'Invalid credentials. Check that you pasted the correct output.' });
+    }
+    console.error('[DB] Credential validation error:', msg);
+    return res.json({ ok: false, error: 'Credential validation failed: ' + msg });
+  }
+
+  dbCredentials = { accessKeyId, secretAccessKey, sessionToken, expiration: expiration || null, updatedAt: new Date().toISOString() };
+  redshiftClient = testClient;
 
   // Persist to disk
   try {
@@ -1056,8 +1100,8 @@ app.post('/api/db-credentials', express.json(), (req, res) => {
     console.error('[DB] Failed to persist credentials:', err.message);
   }
 
-  console.log('[DB] Prod credentials updated via UI');
-  res.json({ ok: true, message: 'Database credentials saved', ...getDbCredentialStatus() });
+  console.log('[DB] Prod credentials updated via UI (validated)');
+  res.json({ ok: true, message: 'Database credentials saved and validated', ...getDbCredentialStatus() });
 });
 
 // Detect pgproxy availability — retry several times since sidecar may start late
@@ -1140,19 +1184,46 @@ async function executeRedshiftDataApi(sql) {
     }
   }
 
-  const execResp = await redshiftClient.send(new ExecuteStatementCommand({
-    WorkgroupName: REDSHIFT_WORKGROUP,
-    Database: REDSHIFT_DATABASE,
-    Sql: sql,
-  }));
+  let execResp;
+  try {
+    execResp = await redshiftClient.send(new ExecuteStatementCommand({
+      WorkgroupName: REDSHIFT_WORKGROUP,
+      Database: REDSHIFT_DATABASE,
+      Sql: sql,
+    }));
+  } catch (err) {
+    if (/ExpiredToken|ExpiredTokenException|InvalidAccessKeyId|SignatureDoesNotMatch|security token.*expired|token.*expired/i.test(err.message || err.name || '')) {
+      dbCredentials = null;
+      redshiftClient = null;
+      throw new Error('DB_CREDENTIALS_EXPIRED: ' + (err.message || 'AWS session token expired'));
+    }
+    throw err;
+  }
 
   let status = 'SUBMITTED', attempts = 0;
   while (status !== 'FINISHED' && status !== 'FAILED' && status !== 'ABORTED' && attempts < 60) {
     await new Promise(r => setTimeout(r, attempts < 5 ? 500 : 2000));
-    const desc = await redshiftClient.send(new DescribeStatementCommand({ Id: execResp.Id }));
-    status = desc.Status;
-    if (status === 'FAILED') throw new Error(desc.Error || 'Query failed');
-    if (status === 'ABORTED') throw new Error('Query aborted');
+    try {
+      const desc = await redshiftClient.send(new DescribeStatementCommand({ Id: execResp.Id }));
+      status = desc.Status;
+      if (status === 'FAILED') {
+        const errMsg = desc.Error || 'Query failed';
+        if (/security token.*expired|token.*expired|credentials.*expired|expired.*token/i.test(errMsg)) {
+          dbCredentials = null;
+          redshiftClient = null;
+          throw new Error('DB_CREDENTIALS_EXPIRED: ' + errMsg);
+        }
+        throw new Error(errMsg);
+      }
+      if (status === 'ABORTED') throw new Error('Query aborted');
+    } catch (pollErr) {
+      if (/ExpiredToken|ExpiredTokenException|InvalidAccessKeyId|SignatureDoesNotMatch/i.test(pollErr.message || pollErr.name || '')) {
+        dbCredentials = null;
+        redshiftClient = null;
+        throw new Error('DB_CREDENTIALS_EXPIRED: AWS session token expired. Paste fresh credentials to continue.');
+      }
+      throw pollErr;
+    }
     attempts++;
   }
   if (status !== 'FINISHED') throw new Error('Query timeout after 120s');
@@ -1165,16 +1236,36 @@ async function executeRedshiftDataApi(sql) {
   return { fields, rows };
 }
 
+// Discovery query cache (svv_tables/svv_columns — rarely changes, cache 10 min)
+const discoveryCache = new Map(); // key → { result, ts }
+const DISCOVERY_CACHE_TTL = 10 * 60 * 1000;
+
 // Unified query executor — picks the right backend
 async function executeQuery(sql, database) {
   const db = database || detectDatabase(sql);
 
+  // Check discovery cache for svv_tables/svv_columns queries
+  const isDiscoveryQ = /\bsvv_tables\b|\bsvv_columns\b/i.test(sql);
+  if (isDiscoveryQ) {
+    const cacheKey = sql.trim().toLowerCase() + '|' + db;
+    const cached = discoveryCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < DISCOVERY_CACHE_TTL) {
+      console.log(`[CACHE] Discovery cache hit: ${sql.slice(0, 60)}...`);
+      return { ...cached.result, database: db };
+    }
+  }
+
   // pgproxy available: use it for everything (Redshift + Aurora)
   if (pgproxyAvailable) {
     const pool = getPool(db);
-    const result = await pool.query(sql);
-    const fields = (result.fields || []).map(f => f.name);
-    return { fields, rows: result.rows || [], database: db };
+    const pgResult = await pool.query(sql);
+    const fields = (pgResult.fields || []).map(f => f.name);
+    const rows = pgResult.rows || [];
+    if (isDiscoveryQ) {
+      const cacheKey = sql.trim().toLowerCase() + '|' + db;
+      discoveryCache.set(cacheKey, { result: { fields, rows }, ts: Date.now() });
+    }
+    return { fields, rows, database: db };
   }
 
   // pgproxy unavailable (ECS): redirect Aurora queries to Redshift
@@ -1182,7 +1273,15 @@ async function executeQuery(sql, database) {
 
   // Fall back to Redshift Data API with stored prod credentials
   const { fields, rows } = await executeRedshiftDataApi(sql);
-  return { fields, rows, database: effectiveDb };
+  const result = { fields, rows, database: effectiveDb };
+
+  // Cache discovery results
+  if (isDiscoveryQ) {
+    const cacheKey = sql.trim().toLowerCase() + '|' + effectiveDb;
+    discoveryCache.set(cacheKey, { result: { fields, rows }, ts: Date.now() });
+  }
+
+  return result;
 }
 
 app.post('/api/query', express.json(), async (req, res) => {
@@ -1868,6 +1967,14 @@ wss.on('connection', (ws, req) => {
   ws.userSession = ws.sessionId ? userTokenStore.get(ws.sessionId) : null;
 
   ws.send(JSON.stringify({ action: 'init', panels }));
+  // Send DB status on every connect so frontend can show warning
+  const dbStatus = getDbCredentialStatus();
+  ws.send(JSON.stringify({
+    action: 'db-status',
+    connected: pgproxyAvailable || dbStatus.status === 'valid',
+    pgproxy: pgproxyAvailable,
+    status: dbStatus.status
+  }));
   if (chatHistory.length > 0) {
     ws.send(JSON.stringify({ action: 'chat-history', messages: chatHistory }));
   }
@@ -1888,6 +1995,18 @@ wss.on('connection', (ws, req) => {
       }
 
       ws.send(JSON.stringify({ action: 'chat-start' }));
+
+      // Warn if DB is not available (pre-check before Claude runs)
+      if (!pgproxyAvailable && !dbCredentialsValid()) {
+        const status = getDbCredentialStatus();
+        const isExpired = status.status === 'expired';
+        ws.send(JSON.stringify({
+          action: 'db-warning',
+          text: isExpired
+            ? 'Database credentials have expired. Queries will fail until you re-authenticate. Open Settings to fix.'
+            : 'Database is not connected. Queries will fail. Open Settings to import credentials.'
+        }));
+      }
 
       // ── Expand slash commands into natural language prompts ──
       // Skills from ~/.claude/skills/ don't work in -p mode, so we
@@ -2176,8 +2295,6 @@ wss.on('connection', (ws, req) => {
             } else if (parsed.type === 'result' || eventType === 'result') {
               const result = parsed.result || event.result;
               if (result) {
-                // Don't overwrite output — it has the full streamed content including SQL blocks
-                // The result is a plain-text summary that strips markdown
                 ws.send(JSON.stringify({ action: 'chat-result', text: result }));
               }
               // Capture session ID for warm subprocess resumption
@@ -2205,6 +2322,7 @@ wss.on('connection', (ws, req) => {
           if (ws.readyState !== WebSocket.OPEN) { console.log(`[WS] Cannot send — ws state: ${ws.readyState}`); return; }
           try { ws.send(JSON.stringify(data)); } catch (e) { console.error(`[WS] Send error: ${e.message}`); }
         };
+        try {
 
         // Auto-execute SQL from Claude's response, then resume session with results/errors
         const sqlBlockRegex = /```sql\n([\s\S]*?)```/g;
@@ -2220,31 +2338,46 @@ wss.on('connection', (ws, req) => {
         if (sqlBlocks.length > 0 && convId) {
           console.log(`[SQL-EXEC] Found ${sqlBlocks.length} SQL blocks, session: ${warmSessions.get(convId)?.sessionId || 'none'}`);
           // Clear the initial streamed text — we'll show clean final output instead
-          safeSend({ action: 'chat-replace', text: '' });
+          safeSend({ action: 'chat-replace', text: '', conversationId: convId });
 
+          let authRequired = false;
           for (const sql of sqlBlocks) {
+            if (authRequired) break;
             let db = detectDatabase(sql);
-            const MAX_ITERATIONS = 50;
+            const MAX_ITERATIONS = 12;
             let currentSql = sql;
 
             let lastQuerySql = null;
             let lastResultTable = null;
             let lastResultMeta = null;
             let discoveryCount = 0;
-            const MAX_DISCOVERY = 50; // No practical limit — let Claude explore freely
+            const MAX_DISCOVERY = 5;
 
-            safeSend({ action: 'chat-status', text: 'Querying database...' });
+            safeSend({ action: 'chat-status', text: 'Querying database...', conversationId: convId });
 
             // Phase 1: Execute queries silently until we have final results or exhaust retries
+            // Helper: add LIMIT to intermediate queries to avoid pulling huge result sets
+            const addLimit = (s, limit = 10) => {
+              if (/\bLIMIT\s+\d+/i.test(s)) return s; // already has LIMIT
+              return s.replace(/;?\s*$/, '') + ` LIMIT ${limit}`;
+            };
+
             for (let i = 0; i < MAX_ITERATIONS; i++) {
+              // Stop if client disconnected
+              if (ws.readyState !== WebSocket.OPEN) {
+                console.log(`[SQL-EXEC] Client disconnected (ws state: ${ws.readyState}), stopping loop`);
+                break;
+              }
               let feedbackMsg;
               let succeeded = false;
               let isDiscovery = false;
               try {
                 const start = Date.now();
                 console.log(`[SQL-EXEC] Iter ${i} on ${db}: ${currentSql.slice(0, 100)}...`);
-                safeSend({ action: 'chat-status', text: `Running query (${i + 1})...` });
-                const result = await executeQuery(currentSql, db);
+                safeSend({ action: 'chat-status', text: `Running query (${i + 1})...`, conversationId: convId });
+                // Intermediate queries are limited to 10 rows; final query runs unlimited
+                const limitedSql = addLimit(currentSql, 10);
+                const result = await executeQuery(limitedSql, db);
                 const duration = Date.now() - start;
                 console.log(`[SQL-EXEC] Success: ${result.rows.length} rows, ${duration}ms`);
                 const fields = result.fields;
@@ -2256,7 +2389,7 @@ wss.on('connection', (ws, req) => {
                 isDiscovery = /\bpg_tables\b|\binformation_schema\b|\bpg_columns\b|\bsvv_tables\b|\bsvv_columns\b|\bSHOW\s/i.test(currentSql);
                 if (isDiscovery) {
                   discoveryCount++;
-                  safeSend({ action: 'chat-status', text: `Discovered schema (${discoveryCount}/${MAX_DISCOVERY}), writing query...` });
+                  safeSend({ action: 'chat-status', text: `Discovered schema (${discoveryCount}/${MAX_DISCOVERY}), writing query...`, conversationId: convId });
                   const forceData = discoveryCount >= MAX_DISCOVERY;
                   feedbackMsg = `Discovery query returned ${result.rows.length} rows (${duration}ms):\n\n${table}\n\n${forceData
                     ? `You have used all ${MAX_DISCOVERY} discovery queries. You MUST now write the actual data query using the tables and columns you have discovered. Do NOT run any more discovery queries. Output a \`\`\`sql block with a SELECT that answers: "${userMessage}"`
@@ -2270,20 +2403,33 @@ wss.on('connection', (ws, req) => {
                 }
               } catch (err) {
                 console.error(`[SQL-EXEC] Iter ${i} error: ${err.message}`);
-                if (/ECONNREFUSED|ETIMEDOUT|DB_CREDENTIALS_|ENOTFOUND/i.test(err.message)) {
-                  safeSend({ action: 'chat-chunk', text: `\n\n**Database error:** ${err.message}\n` });
+                if (/DB_CREDENTIALS_|ExpiredToken|ExpiredTokenException|InvalidAccessKeyId|SignatureDoesNotMatch|security token.*expired|token.*expired|credentials.*expired|expired.*token|expired.*credential/i.test(err.message || '')) {
+                  dbCredentials = null;
+                  redshiftClient = null;
+                  console.log(`[SQL-EXEC] Sending db-auth-required to client, ws state: ${ws.readyState}`);
+                  safeSend({ action: 'chat-chunk', text: '\n\n**Database connection failed.** Credentials are missing or expired. Open Settings to configure database credentials.\n' });
+                  output += '\n\n**Database connection failed.** Credentials are missing or expired.\n';
+                  safeSend({ action: 'db-auth-required', reason: err.message });
+                  console.log(`[SQL-EXEC] db-auth-required sent`);
+                  authRequired = true;
                   break;
                 }
-                safeSend({ action: 'chat-status', text: `Query error, retrying...` });
+                if (/ECONNREFUSED|ETIMEDOUT|ENOTFOUND/i.test(err.message)) {
+                  safeSend({ action: 'chat-chunk', text: `\n\n**Database error:** ${err.message}\n` });
+                  authRequired = true;
+                  break;
+                }
+                safeSend({ action: 'chat-status', text: `Query error, retrying...`, conversationId: convId });
                 feedbackMsg = `Query failed on ${db}.\nSQL: ${currentSql}\nError: ${err.message}\n\nFix the query and output a new \`\`\`sql block. The user asked: "${userMessage}"`;
               }
 
               // Resume Claude session with feedback (silent — no UI output)
+              if (ws.readyState !== WebSocket.OPEN) { console.log(`[SQL-EXEC] Client disconnected before resume, stopping`); break; }
               const sid = warmSessions.get(convId)?.sessionId;
               if (!sid || !feedbackMsg) { console.log(`[SQL-EXEC] No session (${sid}) or feedback — stopping`); break; }
 
               console.log(`[SQL-EXEC] Resuming session ${sid} with ${succeeded ? 'results' : isDiscovery ? 'discovery' : 'error'}...`);
-              if (succeeded && !isDiscovery) safeSend({ action: 'chat-status', text: 'Analyzing results...' });
+              if (succeeded && !isDiscovery) safeSend({ action: 'chat-status', text: 'Analyzing results...', conversationId: convId });
 
               const resumeResult = await new Promise((resolve) => {
                 const args = ['-p', '--verbose', '--output-format', 'stream-json', '--include-partial-messages', '--permission-mode', 'bypassPermissions', '--resume', sid];
@@ -2347,8 +2493,27 @@ wss.on('connection', (ws, req) => {
                 // Claude summarized or gave up — this is the final text
                 console.log(`[SQL-EXEC] Final response (succeeded=${succeeded}), displaying results`);
 
-                // Phase 2: Show final query + results + summary to UI
+                // Phase 2: Re-run final query WITHOUT row limit, then show results
                 console.log(`[SQL-EXEC] Displaying: lastQuery=${!!lastQuerySql}, lastTable=${!!lastResultTable}, summaryLen=${resumeResult.text.length}, wsState=${ws.readyState}`);
+                if (lastQuerySql) {
+                  try {
+                    safeSend({ action: 'chat-status', text: 'Fetching full results...', conversationId: convId });
+                    const finalStart = Date.now();
+                    const finalResult = await executeQuery(lastQuerySql, db);
+                    const finalDuration = Date.now() - finalStart;
+                    const finalFields = finalResult.fields;
+                    let finalTable = '| ' + finalFields.join(' | ') + ' |\n| ' + finalFields.map(() => '---').join(' | ') + ' |\n';
+                    for (const row of finalResult.rows) {
+                      finalTable += '| ' + finalFields.map(f => String(row[f] ?? '')).join(' | ') + ' |\n';
+                    }
+                    lastResultTable = finalTable;
+                    lastResultMeta = `${finalResult.rows.length} rows, ${finalDuration}ms, ${db}`;
+                    console.log(`[SQL-EXEC] Final unlimited query: ${finalResult.rows.length} rows, ${finalDuration}ms`);
+                  } catch (err) {
+                    console.error(`[SQL-EXEC] Final unlimited query failed, using limited results: ${err.message}`);
+                    // Fall back to the limited results we already have
+                  }
+                }
                 if (lastQuerySql && lastResultTable) {
                   const sqlDisplay = `\n\n\`\`\`sql\n${lastQuerySql}\n\`\`\`\n\n**Query results** (${lastResultMeta}):\n\n${lastResultTable}\n\n`;
                   safeSend({ action: 'chat-chunk', text: sqlDisplay });
@@ -2373,6 +2538,12 @@ wss.on('connection', (ws, req) => {
             chatHistory.splice(0, 2);
           }
           saveChatHistory();
+        }
+        } catch (closeErr) {
+          console.error(`[CHAT] Unhandled error in close handler: ${closeErr.message || closeErr}`);
+          console.error(closeErr.stack || closeErr);
+          safeSend({ action: 'chat-chunk', text: `\n\n**Error:** ${closeErr.message || 'Unknown error'}\n` });
+          safeSend({ action: 'db-auth-required', reason: closeErr.message || 'Unknown error' });
         }
         safeSend({ action: 'chat-done', text: output });
       });

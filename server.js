@@ -481,11 +481,27 @@ app.get('/claudio', (req, res) => {
 const PANELS_FILE = path.join(__dirname, '.panels.json');
 let panels = [];
 let _panelSaveTimer = null;
-try { panels = JSON.parse(fs.readFileSync(PANELS_FILE, 'utf-8')); } catch {}
+try {
+  const raw = fs.readFileSync(PANELS_FILE, 'utf-8');
+  const parsed = JSON.parse(raw);
+  if (Array.isArray(parsed) && parsed.length > 0) panels = parsed;
+  else if (Array.isArray(parsed)) panels = [];
+  else { console.error('[PANELS] Corrupt panels file (not an array), ignoring'); }
+} catch (e) {
+  if (e.code !== 'ENOENT') console.error('[PANELS] Failed to load panels:', e.message);
+}
 function savePanels() {
   if (_panelSaveTimer) clearTimeout(_panelSaveTimer);
   _panelSaveTimer = setTimeout(() => {
-    fs.writeFile(PANELS_FILE, JSON.stringify(panels), () => {});
+    // Atomic write: write to temp file then rename (prevents corruption on crash)
+    const tmp = PANELS_FILE + '.tmp';
+    const data = JSON.stringify(panels);
+    fs.writeFile(tmp, data, (err) => {
+      if (err) { console.error('[PANELS] Failed to write temp file:', err.message); return; }
+      fs.rename(tmp, PANELS_FILE, (err2) => {
+        if (err2) console.error('[PANELS] Failed to rename temp file:', err2.message);
+      });
+    });
   }, 200);
 }
 
@@ -1795,14 +1811,27 @@ function broadcast(data) {
 const chatSessions = new Map();
 const CHAT_HISTORY_FILE = path.join(__dirname, '.chat-history.json');
 let chatHistory = [];
-try { chatHistory = JSON.parse(fs.readFileSync(CHAT_HISTORY_FILE, 'utf-8')); } catch {}
+try {
+  const raw = fs.readFileSync(CHAT_HISTORY_FILE, 'utf-8');
+  const parsed = JSON.parse(raw);
+  if (Array.isArray(parsed)) chatHistory = parsed;
+} catch (e) {
+  if (e.code !== 'ENOENT') console.error('[CHAT] Failed to load chat history:', e.message);
+}
 const MAX_HISTORY = 50;
 let _chatSaveTimer = null;
 
 function saveChatHistory() {
   if (_chatSaveTimer) clearTimeout(_chatSaveTimer);
   _chatSaveTimer = setTimeout(() => {
-    fs.writeFile(CHAT_HISTORY_FILE, JSON.stringify(chatHistory), () => {});
+    const tmp = CHAT_HISTORY_FILE + '.tmp';
+    const data = JSON.stringify(chatHistory);
+    fs.writeFile(tmp, data, (err) => {
+      if (err) { console.error('[CHAT] Failed to write temp history:', err.message); return; }
+      fs.rename(tmp, CHAT_HISTORY_FILE, (err2) => {
+        if (err2) console.error('[CHAT] Failed to rename temp history:', err2.message);
+      });
+    });
   }, 200);
 }
 
@@ -2522,7 +2551,8 @@ wss.on('connection', (ws, req) => {
                   lastQuerySql = currentSql;
                   lastResultTable = table;
                   lastResultMeta = `${result.rows.length} rows, ${duration}ms, ${db}`;
-                  feedbackMsg = `Query on ${db} returned ${result.rows.length} rows (${duration}ms):\n\n${table}\n\nIf this data answers the user's question, summarize it. If not (e.g. 0 rows or wrong columns), write a corrected \`\`\`sql block.`;
+                  const wasTruncated = result.rows.length >= 10 && !/\bLIMIT\s+\d+/i.test(currentSql);
+                  feedbackMsg = `Query on ${db} returned ${result.rows.length} rows (${duration}ms)${wasTruncated ? ' (PREVIEW — capped at 10 rows, full results will be shown to user)' : ''}:\n\n${table}\n\nIf this query answers the user's question, summarize it${wasTruncated ? ' (note: user will see ALL rows, not just this preview)' : ''}. If not (e.g. 0 rows or wrong columns), write a corrected \`\`\`sql block.`;
                 }
               } catch (err) {
                 console.error(`[SQL-EXEC] Iter ${i} error: ${err.message}`);
@@ -2653,20 +2683,19 @@ wss.on('connection', (ws, req) => {
           }
         }
 
-        // Save assistant response to history
-        if (output) {
-          chatHistory.push({ role: 'assistant', content: output });
-          // Trim history to keep it manageable
-          while (chatHistory.length > MAX_HISTORY * 2) {
-            chatHistory.splice(0, 2);
-          }
-          saveChatHistory();
-        }
         } catch (closeErr) {
           console.error(`[CHAT] Unhandled error in close handler: ${closeErr.message || closeErr}`);
           console.error(closeErr.stack || closeErr);
           safeSend({ action: 'chat-chunk', text: `\n\n**Error:** ${closeErr.message || 'Unknown error'}\n` });
           safeSend({ action: 'db-auth-required', reason: closeErr.message || 'Unknown error' });
+        }
+        // Save assistant response to history (outside try/catch so SQL errors don't skip it)
+        if (output) {
+          chatHistory.push({ role: 'assistant', content: output });
+          while (chatHistory.length > MAX_HISTORY * 2) {
+            chatHistory.splice(0, 2);
+          }
+          saveChatHistory();
         }
         safeSend({ action: 'chat-done', text: output });
       });

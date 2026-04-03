@@ -159,6 +159,7 @@ const OAUTH_CLIENTS_PATHS = [
   path.join(__dirname, '.oauth-clients.json'),
   path.join(os.homedir(), '.oauth-clients.json'),
 ];
+const OAUTH_CLIENTS_FILE = OAUTH_CLIENTS_PATHS[0];
 for (const p of OAUTH_CLIENTS_PATHS) {
   try {
     const saved = JSON.parse(fs.readFileSync(p, 'utf-8'));
@@ -285,15 +286,10 @@ app.get('/api/auth/callback', async (req, res) => {
     const tokens = await tokenResp.json();
     const accessToken = tokens.access_token || tokens.authed_user?.access_token;
     const refreshToken = tokens.refresh_token;
+    if (!accessToken) throw new Error(`Token exchange returned no access token for ${provider}`);
 
-    let session = userTokenStore.get(flow.sessionId);
-    if (!session) {
-      for (const [, sess] of userTokenStore) { session = sess; break; }
-    }
-    if (!session) {
-      session = { tokens: {}, createdAt: Date.now() };
-      userTokenStore.set(crypto.randomBytes(24).toString('hex'), session);
-    }
+    const session = userTokenStore.get(flow.sessionId);
+    if (!session) throw new Error('Session expired before OAuth completed. Please try connecting again.');
 
     session.tokens[provider] = {
       accessToken: encryptToken(accessToken),
@@ -322,19 +318,8 @@ app.post('/api/auth/:provider/save-tokens', (req, res) => {
   const { access_token, refresh_token, expires_in } = req.body;
   if (!access_token) return res.json({ ok: false, error: 'access_token required' });
 
-  // Try current session first, fall back to any existing session
-  let session = req.userSession;
-  if (!session) {
-    for (const [, sess] of userTokenStore) {
-      session = sess;
-      break;
-    }
-  }
-  if (!session) {
-    session = { tokens: {}, createdAt: Date.now() };
-    const newSid = crypto.randomBytes(24).toString('hex');
-    userTokenStore.set(newSid, session);
-  }
+  const session = req.userSession;
+  if (!session) return res.status(400).json({ ok: false, error: 'Session not found' });
 
   session.tokens[provider] = {
     accessToken: encryptToken(access_token),
@@ -348,14 +333,7 @@ app.post('/api/auth/:provider/save-tokens', (req, res) => {
 
 app.get('/api/auth/:provider/status', (req, res) => {
   const provider = req.params.provider;
-  // Check current session, fall back to any session with tokens
-  let session = req.userSession;
-  if (!session?.tokens?.[provider]) {
-    for (const [, sess] of userTokenStore) {
-      if (sess.tokens?.[provider]) { session = sess; break; }
-    }
-  }
-  const tokenData = session?.tokens?.[provider];
+  const tokenData = req.userSession?.tokens?.[provider];
   if (!tokenData?.accessToken) return res.json({ ok: false, connected: false });
 
   const expired = tokenData.expiresAt && Date.now() > tokenData.expiresAt;
@@ -365,13 +343,7 @@ app.get('/api/auth/:provider/status', (req, res) => {
 // Return decrypted access token for browser-side MCP calls
 app.get('/api/auth/:provider/token', (req, res) => {
   const provider = req.params.provider;
-  let session = req.userSession;
-  if (!session?.tokens?.[provider]) {
-    for (const [, sess] of userTokenStore) {
-      if (sess.tokens?.[provider]) { session = sess; break; }
-    }
-  }
-  const tokenData = session?.tokens?.[provider];
+  const tokenData = req.userSession?.tokens?.[provider];
   if (!tokenData?.accessToken) return res.json({ ok: false });
   res.json({ ok: true, accessToken: decryptToken(tokenData.accessToken) });
 });
@@ -688,14 +660,8 @@ app.get('/api/config', (req, res) => {
   const config = getConfig();
   // Include per-user OAuth status in config response
   const oauthStatus = {};
-  let session = req.userSession;
-  if (!session?.tokens || Object.keys(session.tokens).length === 0) {
-    for (const [, sess] of userTokenStore) {
-      if (sess.tokens && Object.keys(sess.tokens).length > 0) { session = sess; break; }
-    }
-  }
   for (const provider of ['google-workspace', 'slack']) {
-    const td = session?.tokens?.[provider];
+    const td = req.userSession?.tokens?.[provider];
     oauthStatus[provider] = !!(td?.accessToken);
   }
   config.oauthStatus = oauthStatus;
@@ -1892,16 +1858,7 @@ wss.on('connection', (ws, req) => {
       if (!ws.userSession && ws.sessionId) {
         ws.userSession = userTokenStore.get(ws.sessionId);
       }
-      // Fallback: find any session that has tokens (single-user deploy)
-      let activeSession = ws.userSession;
-      if (!activeSession || !activeSession.tokens || Object.keys(activeSession.tokens).length === 0) {
-        for (const [, sess] of userTokenStore) {
-          if (sess.tokens && Object.keys(sess.tokens).length > 0) {
-            activeSession = sess;
-            break;
-          }
-        }
-      }
+      const activeSession = ws.userSession;
 
       let mcpPreFetched = false;
       const mcpIntents = detectMcpIntent(userMessage);
@@ -2227,7 +2184,7 @@ Fix the latest error. If a table/column doesn't exist, try discovering it with: 
                   });
                   const retryOutput = (retryResult.stdout || '').trim();
                   // Try multiple patterns to extract SQL
-                  const retryMatch = retryOutput.match(/```sql\n([\s\S]*?)```/) || retryOutput.match(/```\n?(SELECT[\s\S]*?)```/i) || retryOutput.match(/(SELECT\b[\s\S]*?;)\s*$/im);
+                  const retryMatch = retryOutput.match(/```sql\n([\s\S]*?)```/) || retryOutput.match(/```\n?((?:SELECT|WITH)[\s\S]*?)```/i) || retryOutput.match(/((?:SELECT|WITH)\b[\s\S]*?;)\s*$/im);
                   if (retryMatch && /^\s*(SELECT|WITH)\b/i.test(retryMatch[1].trim())) {
                     currentSql = retryMatch[1].trim();
                   } else {

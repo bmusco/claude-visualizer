@@ -721,6 +721,63 @@ function formatMcpName(raw) {
   return names[raw] || raw.split('-').map(w => w[0].toUpperCase() + w.slice(1)).join(' ');
 }
 
+// Debug endpoint for MCP config troubleshooting
+app.get('/api/debug/mcp', (req, res) => {
+  const info = { home: USER_HOME, cwd: __dirname };
+  // Read .mcp.json from HOME and CWD
+  try { info.homeMcp = JSON.parse(fs.readFileSync(path.join(USER_HOME, '.mcp.json'), 'utf-8')); } catch (e) { info.homeMcp = e.message; }
+  try { info.cwdMcp = JSON.parse(fs.readFileSync(path.join(__dirname, '.mcp.json'), 'utf-8')); } catch (e) { info.cwdMcp = e.message; }
+  // Check credential file
+  const credPath = path.join(USER_HOME, '.claude', 'mcp-credentials', 'atlassian.json');
+  try { const c = JSON.parse(fs.readFileSync(credPath, 'utf-8')); info.creds = { email: c.email, hasToken: !!c.token }; } catch (e) { info.creds = e.message; }
+  // Check wrapper script
+  const wrapperPath = '/app/scripts/atlassian-mcp-wrapper.sh';
+  info.wrapperExists = fs.existsSync(wrapperPath);
+  try { info.wrapperPerms = fs.statSync(wrapperPath).mode.toString(8); } catch {}
+  // Check mcp-atlassian binary
+  try { info.mcpAtlassianPath = execSync('which mcp-atlassian 2>&1', { encoding: 'utf-8', env: { ...process.env, HOME: USER_HOME } }).trim(); } catch (e) { info.mcpAtlassianPath = e.message; }
+  // Try running wrapper to see if it works
+  try { info.wrapperTest = execSync(`${wrapperPath} --version 2>&1`, { encoding: 'utf-8', timeout: 10000, env: { ...process.env, HOME: USER_HOME } }).trim(); } catch (e) { info.wrapperTest = e.stderr || e.message; }
+  // Spawn Claude CLI and ask it to list tools — this reveals if MCP servers connect
+  const testArgs = ['-p', '--verbose', '--output-format', 'stream-json'];
+  try {
+    const mcpFull = JSON.parse(fs.readFileSync(path.join(USER_HOME, '.mcp.json'), 'utf-8'));
+    const stdioServers = {};
+    for (const [name, cfg] of Object.entries(mcpFull.mcpServers || {})) {
+      if (cfg.command) stdioServers[name] = cfg;
+    }
+    if (Object.keys(stdioServers).length > 0) {
+      testArgs.push('--mcp-config', JSON.stringify({ mcpServers: stdioServers }));
+    }
+  } catch {}
+  const testCli = spawn(CLAUDE_CLI, testArgs, {
+    env: { ...process.env, HOME: USER_HOME },
+    cwd: __dirname,
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  testCli.stdin.write('List all MCP tool names available to you in a single JSON array. Output ONLY the JSON array, nothing else.');
+  testCli.stdin.end();
+  let stdout = '', stderr = '';
+  testCli.stdout.on('data', d => stdout += d.toString());
+  testCli.stderr.on('data', d => stderr += d.toString());
+  testCli.on('close', (code) => {
+    info.cliTest = { code, stderr: stderr.slice(0, 2000) };
+    // Parse init event to get tools list
+    try {
+      const initLine = stdout.split('\n').find(l => l.includes('"init"'));
+      if (initLine) {
+        const init = JSON.parse(initLine);
+        info.cliTest.tools = init.tools?.filter(t => t.startsWith('mcp__')) || [];
+        info.cliTest.mcpServers = init.mcp_servers || [];
+      } else {
+        info.cliTest.rawOutput = stdout.slice(0, 2000);
+      }
+    } catch (e) { info.cliTest.parseError = e.message; info.cliTest.rawOutput = stdout.slice(0, 2000); }
+    res.json(info);
+  });
+  setTimeout(() => { try { testCli.kill(); } catch {} }, 60000);
+});
+
 app.get('/api/config', (req, res) => {
   const config = getConfig();
   // Include per-user OAuth status in config response
@@ -2226,9 +2283,21 @@ wss.on('connection', (ws, req) => {
       const cliArgs = ['-p', '--verbose', '--output-format', 'stream-json', '--include-partial-messages', '--permission-mode', 'bypassPermissions'];
       if (selectedModel) cliArgs.push('--model', selectedModel);
 
-      // Quick mode: skip MCP servers for faster response
-      if (skipMcp) {
-        // No special handling needed — MCP flags controlled elsewhere
+      // Load MCP servers via --mcp-config (claude -p doesn't auto-load .mcp.json)
+      // Only include stdio-based servers (url-based servers fail --mcp-config schema validation)
+      if (!skipMcp) {
+        const mcpConfigPath = path.join(USER_HOME, '.mcp.json');
+        try {
+          const mcpFull = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf-8'));
+          const stdioServers = {};
+          for (const [name, cfg] of Object.entries(mcpFull.mcpServers || {})) {
+            if (cfg.command) stdioServers[name] = cfg; // only stdio servers (have "command")
+          }
+          if (Object.keys(stdioServers).length > 0) {
+            const filtered = JSON.stringify({ mcpServers: stdioServers });
+            cliArgs.push('--mcp-config', filtered);
+          }
+        } catch {}
       }
 
       // Warm session: resume previous session for this conversation

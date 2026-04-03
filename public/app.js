@@ -2,15 +2,30 @@
 const API_BASE = window.CLAUDIO_API_BASE || '';
 const WS_BASE = window.CLAUDIO_WS_BASE || '';
 
+function apiFetch(url, options = {}) {
+  return fetch(url, {
+    credentials: 'include',
+    ...options,
+  });
+}
+
+function getWebSocketUrl() {
+  if (!WS_BASE) {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${location.host}`;
+  }
+  if (WS_BASE.startsWith('http://')) return `ws://${WS_BASE.slice('http://'.length)}`;
+  if (WS_BASE.startsWith('https://')) return `wss://${WS_BASE.slice('https://'.length)}`;
+  return WS_BASE;
+}
+
 // WebSocket connection
 let ws;
 let panels = [];
 let currentSlide = 0;
 
 function connect() {
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsHost = WS_BASE || `${protocol}//${location.host}`;
-  ws = new WebSocket(wsHost);
+  ws = new WebSocket(getWebSocketUrl());
 
   ws.onopen = () => {
     document.getElementById('status').textContent = 'Connected';
@@ -56,7 +71,7 @@ function connect() {
 let appConfig = null;
 
 function loadConfig() {
-  fetch(`${API_BASE}/api/config`).then(r => r.json()).then(config => {
+  return apiFetch(`${API_BASE}/api/config`).then(r => r.json()).then(config => {
     appConfig = config;
     renderSettingsDropdown(config);
     renderModelBadge(config);
@@ -249,7 +264,7 @@ function connectIntegration(serverId, shortName, btn) {
   if (badge) { badge.textContent = 'Connecting...'; badge.className = 'integration-badge checking'; }
   if (statusMsg) { statusMsg.textContent = 'Opening sign-in...'; statusMsg.className = 'settings-status-msg'; }
 
-  fetch(`${API_BASE}/api/auth/${serverId}/start`)
+  apiFetch(`${API_BASE}/api/auth/${serverId}/start`)
     .then(r => r.json())
     .then(data => {
       if (!data.ok || !data.authUrl) {
@@ -294,7 +309,7 @@ function checkUserAuthStatus(serverId) {
   const badge = document.getElementById('badge-' + serverId);
   const statusMsg = document.getElementById('status-' + serverId);
   const connectBtn = document.getElementById('connect-btn-' + serverId);
-  fetch(`${API_BASE}/api/auth/${serverId}/status`)
+  apiFetch(`${API_BASE}/api/auth/${serverId}/status`)
     .then(r => r.json())
     .then(data => {
       if (badge) {
@@ -1269,7 +1284,7 @@ function createPanelElement(panel, index) {
           </div>
         </div>`;
         if (docId && docType !== 'File') {
-          fetch(`${API_BASE}/api/gdrive/preview/${docId}?type=${docType.toLowerCase()}`)
+          apiFetch(`${API_BASE}/api/gdrive/preview/${docId}?type=${docType.toLowerCase()}`)
             .then(r => r.json())
             .then(data => {
               const contentEl = body.querySelector('.embed-preview-content');
@@ -2234,7 +2249,7 @@ async function browserPreFetchAndSend(fullText, files, conversationId, editingPa
 
 // Browser-side MCP call to Google Workspace (stateless)
 async function browserMcpCall(provider, toolName, args) {
-  const tokenResp = await fetch(API_BASE + '/api/auth/' + provider + '/token');
+  const tokenResp = await apiFetch(API_BASE + '/api/auth/' + provider + '/token');
   const tokenData = await tokenResp.json();
   if (!tokenData.ok || !tokenData.accessToken) return null;
 
@@ -2254,7 +2269,7 @@ async function browserMcpCall(provider, toolName, args) {
 // Browser-side MCP call to Slack (stateful — needs session)
 let slackSessionId = null;
 async function browserSlackMcpCall(toolName, args) {
-  const tokenResp = await fetch(API_BASE + '/api/auth/slack/token');
+  const tokenResp = await apiFetch(API_BASE + '/api/auth/slack/token');
   const tokenData = await tokenResp.json();
   if (!tokenData.ok || !tokenData.accessToken) return null;
 
@@ -3934,7 +3949,7 @@ let driveSearchCache = new Map(); // query -> files cache
 
 // Pre-fetch recent files on page load for instant access
 function prefetchDriveFiles() {
-  fetch(`${API_BASE}/api/gdrive/search`)
+  apiFetch(`${API_BASE}/api/gdrive/search`)
     .then(r => r.json())
     .then(data => {
       if (data.ok && data.files && data.files.length > 0) {
@@ -4423,7 +4438,7 @@ function openSettingsModal() {
   renderSettingsModal();
   // Auto-test integrations via batch endpoint (faster than individual tests)
   setTimeout(() => {
-    fetch(`${API_BASE}/api/integrations/status`)
+    apiFetch(`${API_BASE}/api/integrations/status`)
       .then(r => r.json())
       .then(data => {
         if (!data.ok) return;
@@ -4894,8 +4909,7 @@ setInterval(() => {
 }, 10000);
 
 // ── Initialize ───────────────────────────────────────────────────
-connect();
-loadConfig();
+loadConfig().finally(connect);
 loadConversations();
 
 // Restore or create initial conversation

@@ -1687,7 +1687,10 @@ async function callGoogleApi(tool, args, accessToken) {
   }
 
   if (tool === 'gdrive_search') {
-    url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`fullText contains '${args.query}'`)}&fields=files(id,name,mimeType,modifiedTime,webViewLink)&pageSize=10`;
+    const safeQuery = String(args.query || '')
+      .replace(/\\/g, '\\\\')
+      .replace(/'/g, "\\'");
+    url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(`fullText contains '${safeQuery}'`)}&fields=files(id,name,mimeType,modifiedTime,webViewLink)&pageSize=10`;
     resp = await fetch(url, { headers });
     if (!resp.ok) return null;
     data = await resp.json();
